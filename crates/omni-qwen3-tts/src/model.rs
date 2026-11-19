@@ -41,6 +41,7 @@ use sha2::Digest;
 
 use crate::codec;
 use crate::config::Config;
+use crate::prompt::Codec;
 use crate::prompt::NO_CODEC;
 use crate::prompt::Prompt;
 use crate::prompt::Tokenizer;
@@ -52,6 +53,8 @@ pub use crate::talker::GROUPS;
 
 const CODEC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/codec.cubin"));
 const TALKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/talker.cubin"));
+/// The codec track reads the sequence's continuous speaker embedding.
+const SPEAKER: i32 = -2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -155,12 +158,27 @@ impl Model {
         ensure!(n > 0 && n <= self.limits.max_batch, "{n} sequences in one call");
         let tokens: usize = rows.iter().map(|(_, p, _)| p.len()).sum();
         ensure!(tokens <= self.limits.max_tokens, "{tokens} prompt tokens exceed {}", self.limits.max_tokens);
+        let hidden = self.config.model.talker_config.stack.hidden_size;
         let mut t = Rows::default();
         let mut last_row = Vec::with_capacity(n);
         for (s, (seq, prompt, _)) in rows.iter().enumerate() {
-            ensure!(seq.frames == 0 && prompt.len() == seq.prompt, "sequence {s} is not fresh");
+            ensure!(seq.frames == 0 && !prompt.is_empty() && prompt.len() == seq.prompt, "sequence {s} is not fresh");
             t.ids.extend(&prompt.text);
-            t.codec.extend(&prompt.codec);
+            for contribution in &prompt.codec {
+                t.codec.push(match contribution {
+                    Codec::None => NO_CODEC,
+                    Codec::Token(id) => {
+                        ensure!(*id >= NO_CODEC, "invalid prompt codec token {id}");
+                        *id
+                    }
+                    Codec::Speaker(embedding) => {
+                        ensure!(embedding.len() == hidden, "sequence {s} needs {hidden} speaker values");
+                        t.speakers.resize(s * hidden * size_of::<f32>(), 0);
+                        t.speakers.extend(embedding.iter().flat_map(|x| x.to_le_bytes()));
+                        SPEAKER
+                    }
+                });
+            }
             t.push_seq(&seq.lease, 0..prompt.len(), s);
             last_row.push(t.pos.len() as i32 - 1);
         }
@@ -267,6 +285,7 @@ impl Model {
 struct Rows {
     ids: Vec<i32>,
     codec: Vec<i32>,
+    speakers: Vec<u8>,
     pos: Vec<i32>,
     slot: Vec<i32>,
     seq: Vec<i32>,
@@ -292,6 +311,9 @@ impl Rows {
         if prompt {
             rt.write_input_at("t_ids", &ints(&self.ids), v)?;
             rt.write_input_at("t_codec", &ints(&self.codec), v)?;
+            if !self.speakers.is_empty() {
+                rt.write_input_at("t_speaker", &self.speakers, v)?;
+            }
         }
         rt.write_input_at("t_pos", &ints(&self.pos), v)?;
         rt.write_input_at("t_slot", &ints(&self.slot), v)?;
@@ -350,10 +372,11 @@ fn generate(
     g.input("force", json!(["seqs", GROUPS]), json!({"min": -1, "max": vocab - 1}));
     g.buffer("uniforms", "f32", json!(["seqs", GROUPS]), "input");
     g.input("t_ids", json!(["tokens"]), json!({"index_into": talker.text_embedding()}));
-    g.input("t_codec", json!(["tokens"]), json!({"min": NO_CODEC, "max": vocab - 1}));
+    g.input("t_codec", json!(["tokens"]), json!({"min": SPEAKER, "max": vocab - 1}));
+    g.buffer("t_speaker", "f32", json!(["seqs", h]), "input");
     g.input("t_pos", json!(["tokens"]), min(0));
     g.input("t_slot", json!(["tokens"]), json!({"index_into": "kv0"}));
-    g.input("t_seq", json!(["tokens"]), min(0));
+    g.input("t_seq", json!(["tokens"]), json!({"index_into": "t_speaker"}));
     g.input("last_row", json!(["seqs"]), min(0));
     g.input("kv_indptr", json!([max_seqs + 1]), json!({"min": 0, "monotone": true}));
     g.input("kv_pages", json!([page_table]), json!({"index_into": "kv0", "stride": PAGE}));

@@ -201,7 +201,15 @@ impl Talker {
             "talker_prompt_codec",
             [rows.clone(), json!(1), json!(1)],
             (h / 8) as u32,
-            vec![io("embeds"), inb(&self.fc2.1), inb(&self.codec_emb), ini("t_codec"), i32a(h)],
+            vec![
+                io("embeds"),
+                inb(&self.fc2.1),
+                inb(&self.codec_emb),
+                ini("t_codec"),
+                inf("t_speaker"),
+                ini("t_seq"),
+                i32a(h),
+            ],
         );
         let pass = Pass {
             label: "prefill",
