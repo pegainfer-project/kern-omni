@@ -5,8 +5,11 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+use crate::mel;
 
 pub use omni_qwen3::config::Stack;
 
@@ -31,10 +34,50 @@ pub struct Talker {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Model {
+    #[serde(flatten)]
+    pub tts_model_type: TtsModelType,
     pub tts_bos_token_id: i32,
     pub tts_eos_token_id: i32,
     pub tts_pad_token_id: i32,
     pub talker_config: Talker,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "tts_model_type", rename_all = "snake_case")]
+pub enum TtsModelType {
+    Base { speaker_encoder_config: SpeakerEncoderConfig },
+    CustomVoice,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct SpeakerEncoderConfig {
+    pub sample_rate: u32,
+    pub mel_dim: usize,
+    pub enc_dim: usize,
+    pub enc_channels: Vec<usize>,
+    pub enc_kernel_sizes: Vec<usize>,
+    pub enc_dilations: Vec<usize>,
+    pub enc_attention_channels: usize,
+    pub enc_res2net_scale: usize,
+    pub enc_se_channels: usize,
+}
+
+impl Default for SpeakerEncoderConfig {
+    /// Base checkpoints can omit the speaker encoder's architectural defaults.
+    fn default() -> Self {
+        Self {
+            sample_rate: mel::SAMPLE_RATE,
+            mel_dim: mel::BINS,
+            enc_dim: 1024,
+            enc_channels: vec![512, 512, 512, 512, 1536],
+            enc_kernel_sizes: vec![5, 3, 3, 3, 1],
+            enc_dilations: vec![1, 2, 3, 4, 1],
+            enc_attention_channels: 128,
+            enc_res2net_scale: 8,
+            enc_se_channels: 128,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -92,8 +135,21 @@ fn read<T: DeserializeOwned>(path: &Path) -> Result<T> {
 impl Config {
     pub fn load(dir: &Path) -> Result<Self> {
         let codec: CodecFile = read(&dir.join("speech_tokenizer/config.json"))?;
+        let model: Model = read(&dir.join("config.json"))?;
+        if let TtsModelType::Base { speaker_encoder_config } = &model.tts_model_type {
+            let c = speaker_encoder_config;
+            ensure!(
+                c.sample_rate == mel::SAMPLE_RATE,
+                "speaker encoder expects {} Hz, got {} Hz",
+                mel::SAMPLE_RATE,
+                c.sample_rate
+            );
+            ensure!(c.mel_dim == mel::BINS, "speaker encoder expects {} mel bins, got {}", mel::BINS, c.mel_dim);
+            let hidden = model.talker_config.stack.hidden_size;
+            ensure!(c.enc_dim == hidden, "talker expects speaker embeddings of width {hidden}, got {}", c.enc_dim);
+        }
         Ok(Self {
-            model: read(&dir.join("config.json"))?,
+            model,
             generation: read(&dir.join("generation_config.json"))?,
             sample_rate: codec.output_sample_rate,
             samples_per_frame: codec.decode_upsample_rate,
