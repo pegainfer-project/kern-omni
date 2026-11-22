@@ -233,7 +233,7 @@ async fn reference_at_the_engine_rate_preserves_signed_samples_and_transcript() 
     let padded = wav_with_metadata(&wav, b"JUNK\x01\0\0\0x\0");
     let audio = wav_uri(&padded);
     let transcript = r#"She said, "你好。""#;
-    let body = reference_body(json!({ "ref_audio": audio, "ref_text": transcript }));
+    let body = reference_body(json!({ "ref_audio": audio, "ref_text": transcript, "x_vector_only_mode": null }));
     let escaped = body.to_string().replacen("audio/wav", r"audio\/wav", 1);
     let response = app.oneshot(speech_request(Body::from(escaped))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -250,11 +250,15 @@ async fn stereo_reference_downmixes_both_channels_without_overflow() {
     let samples = [i16::MAX, i16::MAX, i16::MIN, i16::MIN, 2000, -4000, -231, 231];
     let stereo = pcm(samples.into_iter().cycle().take(2 * REFERENCE_RATE as usize));
     let mono = pcm([i16::MAX, i16::MIN, -1000, 0].into_iter().cycle().take(REFERENCE_RATE as usize));
-    let body = audio_only_body(&reference_wav(REFERENCE_RATE, 2, &stereo));
-    let reference = submitted_reference(&app, &inbox, body).await;
+    let wav = reference_wav(REFERENCE_RATE, 2, &stereo);
+    for text in [Value::Null, json!("ignored in audio-only mode")] {
+        let mut body = audio_only_body(&wav);
+        body["ref_text"] = text;
+        let reference = submitted_reference(&app, &inbox, body).await;
 
-    assert!(matches!(reference.mode, ReferenceMode::AudioOnly));
-    assert_eq!((reference.sample_rate, reference.pcm.as_ref()), (REFERENCE_RATE, mono.as_slice()));
+        assert!(matches!(reference.mode, ReferenceMode::AudioOnly));
+        assert_eq!((reference.sample_rate, reference.pcm.as_ref()), (REFERENCE_RATE, mono.as_slice()));
+    }
 }
 
 #[tokio::test]
@@ -295,9 +299,7 @@ async fn invalid_references_name_the_field_and_never_reach_the_engine() {
     let missing_pad = wav_with_metadata(&wav, b"JUNK\x01\0\0\0x");
     let cases = [
         ("missing audio", json!({ "ref_text": "hello" }), "ref_audio"),
-        ("numeric audio", json!({ "ref_audio": 4 }), "ref_audio"),
-        ("array audio", json!({ "ref_audio": ["clip"] }), "ref_audio"),
-        ("object transcript", json!({ "ref_audio": audio, "ref_text": { "text": "hello" } }), "ref_text"),
+        ("null audio", json!({ "ref_audio": null, "ref_text": "hello" }), "ref_audio"),
         ("bare base64", json!({ "ref_audio": STANDARD.encode(&wav), "ref_text": "hello" }), "ref_audio"),
         ("bad base64", json!({ "ref_audio": "data:audio/wav;base64,!!!", "ref_text": "hello" }), "ref_audio"),
         ("truncated data", json!({ "ref_audio": wav_uri(&wav[..wav.len() - 1]), "ref_text": "hello" }), "ref_audio"),
@@ -310,15 +312,21 @@ async fn invalid_references_name_the_field_and_never_reach_the_engine() {
             "speed",
         ),
         ("blank transcript", json!({ "ref_audio": audio, "ref_text": " \n\t" }), "ref_text"),
-        (
-            "audio-only with text",
-            json!({ "ref_audio": audio, "ref_text": "hello", "x_vector_only_mode": true }),
-            "ref_text",
-        ),
-        ("null mode", json!({ "ref_audio": audio, "x_vector_only_mode": null }), "x_vector_only_mode"),
+        ("null transcript", json!({ "ref_audio": audio, "ref_text": null }), "ref_text"),
     ];
     for (label, fields, param) in cases {
         assert_reference_error(&app, &inbox, label, reference_body(fields), param).await;
+    }
+
+    for fields in [
+        json!({ "ref_audio": ["clip"] }),
+        json!({ "ref_text": { "text": "hello" } }),
+        json!({ "x_vector_only_mode": "true" }),
+    ] {
+        let (status, _, bytes) = post(&app, reference_body(fields)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error(&bytes), ("invalid_request_error".into(), None));
+        assert_eq!(inbox.rx.try_recv().err(), Some(TryRecvError::Empty));
     }
 
     let (audio_only_app, inbox) = reference_app(true, false);

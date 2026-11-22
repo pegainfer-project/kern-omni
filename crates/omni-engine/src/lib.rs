@@ -246,9 +246,6 @@ impl EngineInfo {
             });
         }
         let mode = if audio_only {
-            if text.is_some() {
-                return Err(Invalid { param: "ref_text", message: "must be omitted in audio-only mode".into() });
-            }
             ReferenceMode::AudioOnly
         } else {
             let text = text.filter(|text| !text.trim().is_empty()).ok_or_else(|| Invalid {
