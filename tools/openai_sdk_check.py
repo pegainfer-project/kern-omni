@@ -54,8 +54,8 @@ def main() -> None:
         assert voices == [], voices
         voice = "alloy"
         reference = {**extra, "ref_audio": reference_wav_uri()}
-        audio_only = {**reference, "x_vector_only_mode": True}
         icl = {**reference, "ref_text": "A reference transcript."}
+        audio_only = {**icl, "x_vector_only_mode": True}
     else:
         voice = voices[0]
         audio_only = icl = extra

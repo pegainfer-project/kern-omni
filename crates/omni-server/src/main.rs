@@ -387,6 +387,7 @@ impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
             sample_rate: self.sample_rate,
+            reference_audio: self.reference_audio,
             frame_rate: self.frame_rate,
             frames_per_char: self.frames_per_char,
             max_frames: self.max_frames,
@@ -407,21 +408,7 @@ fn main() -> anyhow::Result<()> {
     let (serve, (engines, engine, model)): (Serve, Started) = match Cli::parse().command {
         Command::Sim(args) => {
             let profile = args.profile()?;
-            let mut info = profile.info(&args.model);
-            let queue = if args.reference_audio {
-                info.voices.clear();
-                info.reference_audio = Some(omni_engine::ReferenceAudioInfo {
-                    sample_rate: 24_000,
-                    duration_seconds: 1..=30,
-                    audio_only: true,
-                    with_transcript: true,
-                });
-                // Each queued submission owns its reference audio until the sim takes it.
-                args.serve.queue.min(8)
-            } else {
-                args.serve.queue
-            };
-            let (handle, inbox) = omni_engine::channel(info, queue);
+            let (handle, inbox) = omni_engine::channel(profile.info(&args.model), args.serve.queue);
             (args.serve, (handle.into(), omni_sim::spawn(inbox, profile), args.model))
         }
         Command::SimLive(args) => {
