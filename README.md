@@ -147,10 +147,10 @@ Speech engines can opt into three top-level request fields:
 WAV sources may have one or two channels at 16, 24, 44.1, or 48 kHz. The
 server checks clip duration at the source rate, mixes to mono, and resamples
 to the engine's reference input rate. `voice` is still required and can be a
-placeholder when the server lists no preset voices. With reference audio
-enabled, speech request bodies are limited to 8 MiB, and at most four can
-be read or prepared at once. Excess requests receive `429`. The server
-allows 60 seconds to receive the full body and returns `408` on timeout.
+placeholder when the server lists no preset voices. The reference route
+allows up to 60 seconds to read a request body of at most 8 MiB. A read
+timeout returns `408`. Once the body arrives, at most four requests can
+be prepared on blocking workers. A full conversion pool returns `429`.
 
 `pega-omni sim --reference-audio` accepts both modes with 1–30 second clips
 and a 24 kHz reference input rate. The SDK check sends the reference fields

@@ -1,6 +1,5 @@
 use std::convert::Infallible;
 use std::sync::mpsc::TryRecvError;
-use std::task::Poll;
 use std::time::Duration;
 
 use axum::Router;
@@ -343,7 +342,7 @@ async fn invalid_references_name_the_field_and_never_reach_the_engine() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stalled_uploads_release_their_permits_on_disconnect_or_timeout() {
+async fn stalled_uploads_allow_completed_uploads_and_time_out() {
     let (app, inbox) = reference_app(true, false);
     let mut uploads = Vec::new();
     for _ in 0..4 {
@@ -357,20 +356,16 @@ async fn stalled_uploads_release_their_permits_on_disconnect_or_timeout() {
         tokio::time::timeout(UPLOAD_TIMEOUT, polled).await.expect("body poll").expect("upload still running");
     }
 
-    let unread = stream::poll_fn(|_| -> Poll<Option<Result<Bytes, Infallible>>> {
-        panic!("overload must be detected before polling the body");
-    });
-    let future = app.clone().oneshot(speech_request(Body::from_stream(unread)));
-    let rejected = tokio::time::timeout(UPLOAD_TIMEOUT, future).await.expect("immediate rejection").unwrap();
-    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wav = reference_wav(REFERENCE_RATE, 1, &vec![0; 2 * REFERENCE_RATE as usize]);
+    let reference = tokio::time::timeout(UPLOAD_TIMEOUT, submitted_reference(&app, &inbox, audio_only_body(&wav)))
+        .await
+        .expect("completed upload should reach the engine while other uploads are stalled");
+    assert_eq!(reference.pcm.len(), 2 * REFERENCE_RATE as usize);
     assert_eq!(inbox.rx.try_recv().err(), Some(TryRecvError::Empty));
 
     let aborted = uploads.pop().unwrap();
     aborted.abort();
     assert!(aborted.await.unwrap_err().is_cancelled());
-    // A new upload can now acquire the released slot alongside the three still pending.
-    let stalled = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
-    uploads.push(tokio::spawn(app.clone().oneshot(speech_request(stalled))));
     for upload in uploads {
         let response =
             tokio::time::timeout(Duration::from_secs(61), upload).await.expect("upload deadline").unwrap().unwrap();
@@ -379,9 +374,42 @@ async fn stalled_uploads_release_their_permits_on_disconnect_or_timeout() {
         assert_eq!(error(&bytes), ("invalid_request_error".into(), None));
     }
     assert_eq!(inbox.rx.try_recv().err(), Some(TryRecvError::Empty));
-    let wav = reference_wav(REFERENCE_RATE, 1, &vec![0; 2 * REFERENCE_RATE as usize]);
-    let recovered = submitted_reference(&app, &inbox, audio_only_body(&wav)).await;
-    assert_eq!(recovered.pcm.len(), 2 * REFERENCE_RATE as usize);
+}
+
+#[test]
+fn a_full_reference_conversion_pool_rejects_until_work_finishes() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().max_blocking_threads(1).build().unwrap();
+    runtime.block_on(async {
+        let (app, inbox) = reference_app(true, false);
+        // Queue conversions behind one blocking task so none can finish during admission.
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, occupied) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        occupied.await.unwrap();
+
+        let request = || app.clone().oneshot(speech_request(Body::from("{")));
+        let mut conversions = Vec::new();
+        for _ in 0..4 {
+            let mut conversion = Box::pin(request());
+            assert!(futures_util::poll!(conversion.as_mut()).is_pending());
+            conversions.push(conversion);
+        }
+        drop(conversions.pop().unwrap());
+        let response = tokio::time::timeout(UPLOAD_TIMEOUT, request()).await.expect("immediate rejection").unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        for conversion in conversions {
+            assert_eq!(conversion.await.unwrap().status(), StatusCode::BAD_REQUEST);
+        }
+        let wav = reference_wav(REFERENCE_RATE, 1, &vec![0; 2 * REFERENCE_RATE as usize]);
+        let reference = submitted_reference(&app, &inbox, audio_only_body(&wav)).await;
+        assert_eq!(reference.pcm.len(), 2 * REFERENCE_RATE as usize);
+    });
 }
 
 #[tokio::test]

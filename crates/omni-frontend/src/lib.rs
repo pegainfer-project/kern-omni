@@ -3,9 +3,10 @@
 //! The front end knows no model. It parses a request against the engine's
 //! [`EngineInfo`](omni_engine::EngineInfo), hands a checked
 //! [`Speech`](omni_engine::Speech) to the engine through a
-//! [`Handle`], and streams whatever audio comes back. A full engine queue is
-//! an immediate `429`. Reference audio routes also bound concurrent reads and
-//! CPU preparation before engine admission.
+//! [`Handle`], and streams whatever audio comes back. A full engine queue or
+//! conversion pool returns an immediate `429`. Reference uploads have up to
+//! 60 seconds to deliver at most 8 MiB. Once the body arrives, up to four
+//! requests can be prepared on blocking workers before engine admission.
 //!
 //! A server fronts a speech, a live (full-duplex) or an image engine
 //! ([`Engines`]). Routes: `POST /v1/audio/speech` (speech), the GPT-Live
@@ -132,7 +133,7 @@ struct Shared {
 
 const DEMO: &str = include_str!("live.html");
 const REFERENCE_BODY_LIMIT: usize = 8 * 1024 * 1024;
-const REFERENCE_READS: usize = 4;
+const REFERENCE_CONVERSIONS: usize = 4;
 const REFERENCE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The full route table over `engines`; `prometheus` enables `/metrics`.
@@ -141,7 +142,7 @@ pub fn router(engines: impl Into<Engines>, prometheus: Option<PrometheusHandle>)
     let speech_route = if engines.speech().is_some_and(|engine| engine.info.reference_audio.is_some()) {
         post(speech_with_reference)
             .route_layer(DefaultBodyLimit::max(REFERENCE_BODY_LIMIT))
-            .route_layer(Extension(Arc::new(Semaphore::new(REFERENCE_READS))))
+            .route_layer(Extension(Arc::new(Semaphore::new(REFERENCE_CONVERSIONS))))
     } else {
         post(speech)
     };
@@ -238,10 +239,6 @@ async fn speech_with_reference(
 ) -> Result<Response, ApiError> {
     let arrived = Instant::now();
     let engine = s.engines.speech().ok_or_else(|| not_here("speech"))?;
-    let permit = slots.try_acquire_owned().map_err(|_| {
-        metrics::counter!("omni_requests_total", "outcome" => "rejected").increment(1);
-        ApiError::overloaded("reference audio preparation is full".into())
-    })?;
     let body = match tokio::time::timeout(REFERENCE_UPLOAD_TIMEOUT, Bytes::from_request(request, &s)).await {
         Ok(Ok(body)) => Ok(body),
         Ok(Err(e)) => Err(ApiError { status: e.status(), ..ApiError::invalid(None, e.body_text()) }),
@@ -255,6 +252,10 @@ async fn speech_with_reference(
     }
     .inspect_err(|_| {
         metrics::counter!("omni_requests_total", "outcome" => "invalid").increment(1);
+    })?;
+    let permit = slots.try_acquire_owned().map_err(|_| {
+        metrics::counter!("omni_requests_total", "outcome" => "rejected").increment(1);
+        ApiError::overloaded("reference audio preparation is full".into())
     })?;
     let info = engine.info.clone();
     let parsed = tokio::task::spawn_blocking(move || {
