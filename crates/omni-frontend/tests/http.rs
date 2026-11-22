@@ -250,14 +250,22 @@ async fn stereo_reference_downmixes_both_channels_without_overflow() {
     let samples = [i16::MAX, i16::MAX, i16::MIN, i16::MIN, 2000, -4000, -231, 231];
     let stereo = pcm(samples.into_iter().cycle().take(2 * REFERENCE_RATE as usize));
     let mono = pcm([i16::MAX, i16::MIN, -1000, 0].into_iter().cycle().take(REFERENCE_RATE as usize));
-    let wav = reference_wav(REFERENCE_RATE, 2, &stereo);
-    for text in [Value::Null, json!("ignored in audio-only mode")] {
-        let mut body = audio_only_body(&wav);
+    let standard = reference_wav(REFERENCE_RATE, 2, &stereo);
+    let extensible = extensible_stereo_wav(&stereo);
+    let mut extensible_default_bits = extensible.clone();
+    extensible_default_bits[38] = 0;
+    for (label, wav, text) in [
+        ("standard PCM16", &standard, Value::Null),
+        ("standard PCM16 with transcript", &standard, json!("ignored in audio-only mode")),
+        ("extensible PCM16", &extensible, Value::Null),
+        ("extensible PCM16 with unspecified valid bits", &extensible_default_bits, Value::Null),
+    ] {
+        let mut body = audio_only_body(wav);
         body["ref_text"] = text;
         let reference = submitted_reference(&app, &inbox, body).await;
 
-        assert!(matches!(reference.mode, ReferenceMode::AudioOnly));
-        assert_eq!((reference.sample_rate, reference.pcm.as_ref()), (REFERENCE_RATE, mono.as_slice()));
+        assert!(matches!(reference.mode, ReferenceMode::AudioOnly), "{label}");
+        assert_eq!((reference.sample_rate, reference.pcm.as_ref()), (REFERENCE_RATE, mono.as_slice()), "{label}");
     }
 }
 
@@ -396,4 +404,63 @@ async fn streaming_uploads_obey_the_route_body_limit_without_content_length() {
 
     let preset = app().oneshot(oversized(2)).await.unwrap();
     assert_eq!(preset.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+fn extensible_stereo_wav(samples: &[u8]) -> Vec<u8> {
+    let mut wav = reference_wav(REFERENCE_RATE, 2, samples);
+    // cbSize, valid bits, front left/right channel mask, PCM subtype GUID.
+    let extension = b"\x16\0\x10\0\x03\0\0\0\x01\0\0\0\0\0\x10\0\x80\0\0\xaa\0\x38\x9b\x71";
+    let data_header = WAV_HEADER_LEN - 8;
+    wav.splice(data_header..data_header, extension.iter().copied());
+    let riff_size = u32::try_from(wav.len() - 8).unwrap();
+    wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    wav[16..20].copy_from_slice(&40u32.to_le_bytes());
+    wav[20..22].copy_from_slice(&0xfffeu16.to_le_bytes());
+    wav
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+
+    #[test]
+    fn malformed_reference_riff_never_reaches_the_engine(
+        tail in proptest::collection::vec(proptest::num::u8::ANY, 1..=16),
+        extra in 1u32..=u32::MAX - 16,
+        valid_bits in 1u8..16,
+    ) {
+        let samples = vec![0; 4 * REFERENCE_RATE as usize];
+        let wav = reference_wav(REFERENCE_RATE, 2, &samples);
+        let with_tail = |parts: &[&[u8]]| {
+            let mut wav = wav.clone();
+            wav.extend(parts.iter().flat_map(|part| part.iter().copied()));
+            let size = u32::try_from(wav.len() - 8).unwrap();
+            wav[4..8].copy_from_slice(&size.to_le_bytes());
+            wav
+        };
+        let malformed_extension = |offset, value| {
+            let mut wav = extensible_stereo_wav(&samples);
+            wav[offset] = value;
+            wav
+        };
+        let declared_chunk_size = (u32::try_from(tail.len()).unwrap() + extra).to_le_bytes();
+        let mut partial_frame = samples.clone();
+        partial_frame.extend_from_slice(&[0, 0]);
+        let malformed = [
+            ("arbitrary bytes", tail.clone()),
+            ("truncated trailing chunk header", with_tail(&[b"JUNK"])),
+            ("trailing chunk exceeds RIFF bounds", with_tail(&[b"JUNK", &declared_chunk_size, &tail])),
+            ("missing trailing chunk pad", with_tail(&[b"JUNK\x01\0\0\0", &tail[..1]])),
+            ("duplicate data chunk", with_tail(&[b"data\0\0\0\0"])),
+            ("incomplete stereo frame", reference_wav(REFERENCE_RATE, 2, &partial_frame)),
+            ("invalid extensible cbSize", malformed_extension(36, 21)),
+            ("invalid extensible valid bits", malformed_extension(38, valid_bits)),
+            ("extensible float subtype", malformed_extension(44, 3)),
+        ];
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (app, inbox) = reference_app(true, false);
+            for (label, wav) in malformed {
+                assert_reference_error(&app, &inbox, label, audio_only_body(&wav), "ref_audio").await;
+            }
+        });
+    }
 }
