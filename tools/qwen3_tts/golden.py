@@ -15,7 +15,7 @@
 # url = "https://download.pytorch.org/whl/cu130"
 # explicit = true
 # ///
-"""Ground truth for Qwen3-TTS CustomVoice and Base, from the official package.
+"""Ground truth for Qwen3-TTS CustomVoice, VoiceDesign and Base, from the official package.
 
 Records one sample with the non-streaming text layout unless explicitly changed:
 
@@ -26,18 +26,21 @@ Records one sample with the non-streaming text layout unless explicitly changed:
     codes            [T, 16]      the sampled frames (teacher-forcing input)
     wav              [T*1920]     generated audio, float in [-1, 1]
 
+VoiceDesign records the voice description and its token IDs (instruct_ids).
 Base additionally records the prepared reference PCM, FP32 speaker mel and its
 BF16 encoder input, and speaker embedding. ICL also records reference text IDs,
 reference codes and the codec quantizer's input. Both layouts record
 trailing_text_hidden and tts_pad_embed for decode replay.
-The Base waveform is decoded continuously with the complete ICL reference
-prefix, saved as wav_full, and cropped at the exact reference-frame boundary.
-The public decoder's 300-frame chunking is not a continuous-decoding oracle.
+All waveforms use continuous decoding to match the server's causal state.
+Base includes the complete ICL reference prefix, saves wav_full, and crops at
+the exact reference-frame boundary.
 
 Logits are pre-processor (no penalty, suppression or temperature), so a
 teacher-forced replay of `codes` must match them regardless of sampling.
 
     uv run tools/qwen3_tts/golden.py --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice --out golden.safetensors
+    uv run tools/qwen3_tts/golden.py --model /path/to/Qwen3-TTS-12Hz-1.7B-VoiceDesign --mode voicedesign \
+        --instructions "A low, slow voice." --out design.safetensors
     uv run tools/qwen3_tts/golden.py --model /path/to/Qwen3-TTS-12Hz-1.7B-Base --mode icl \
         --ref-audio reference.wav --ref-text "The reference transcript." --out base.safetensors
 
@@ -69,10 +72,11 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--text", default="The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun.")
-    ap.add_argument("--speaker", default="ryan")
+    ap.add_argument("--speaker", help="CustomVoice speaker (default: ryan)")
+    ap.add_argument("--instructions", help="voice description for VoiceDesign")
     ap.add_argument("--language", default="english")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--mode", choices=["customvoice", "xvector", "icl"], default="customvoice")
+    ap.add_argument("--mode", choices=["customvoice", "voicedesign", "xvector", "icl"], default="customvoice")
     ap.add_argument("--ref-audio", type=Path)
     ap.add_argument("--ref-text")
     ap.add_argument("--non-streaming-mode", choices=["true", "false"], default="true")
@@ -84,14 +88,22 @@ def main() -> None:
         "--min-trailing-tokens", type=int, default=0, help="Reject cases without the requested trailing text."
     )
     args = ap.parse_args()
-    if args.mode != "customvoice" and args.ref_audio is None:
+    base = args.mode in {"xvector", "icl"}
+    if base and args.ref_audio is None:
         ap.error("Base modes require --ref-audio")
     if args.mode == "icl" and not args.ref_text:
         ap.error("ICL requires --ref-text")
     if args.mode != "icl" and args.ref_text is not None:
         ap.error("--ref-text is only used by ICL")
-    if args.mode == "customvoice" and args.ref_audio is not None:
-        ap.error("CustomVoice does not use --ref-audio")
+    if not base and args.ref_audio is not None:
+        ap.error("--ref-audio is only used by Base modes")
+    if args.mode == "voicedesign" and (not args.instructions or not args.instructions.strip()):
+        ap.error("VoiceDesign requires nonblank --instructions")
+    if args.mode != "voicedesign" and args.instructions is not None:
+        ap.error("--instructions is only used by VoiceDesign")
+    if args.mode == "voicedesign" and args.speaker is not None:
+        ap.error("VoiceDesign has no preset --speaker")
+    speaker = (args.speaker or "ryan") if args.mode == "customvoice" else None
     reference = None
     if args.ref_audio is not None:
         reference, sample_rate = sf.read(args.ref_audio, dtype="float32")
@@ -100,7 +112,7 @@ def main() -> None:
 
     tts = Qwen3TTSModel.from_pretrained(args.model, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation="sdpa")
     model = tts.model
-    expected = "custom_voice" if args.mode == "customvoice" else "base"
+    expected = {"customvoice": "custom_voice", "voicedesign": "voice_design"}.get(args.mode, "base")
     if model.tts_model_type != expected:
         ap.error(f"--mode {args.mode} requires model type {expected}, got {model.tts_model_type}")
     tensors = {}
@@ -177,11 +189,14 @@ def main() -> None:
             tensors["ref_text_ids"] = cpu(ref_ids[0], torch.int64)
 
     generate_kwargs = tts._merge_generate_kwargs(max_new_tokens=args.max_new_tokens)
-    mode_kwargs = (
-        {"instruct_ids": [None], "speakers": [args.speaker]}
-        if args.mode == "customvoice"
-        else {"ref_ids": [ref_ids], "voice_clone_prompt": prompt}
-    )
+    if base:
+        mode_kwargs = {"ref_ids": [ref_ids], "voice_clone_prompt": prompt}
+    else:
+        instruct_ids = None
+        if args.instructions is not None:
+            instruct_ids = tts._tokenize_texts([tts._build_instruct_text(args.instructions)])[0]
+            tensors["instruct_ids"] = cpu(instruct_ids[0], torch.int64)
+        mode_kwargs = {"instruct_ids": [instruct_ids], "speakers": [speaker]}
     codes, _ = model.generate(
         input_ids=[text_ids[None].cuda()],
         languages=[args.language],
@@ -211,16 +226,13 @@ def main() -> None:
     samples_per_frame = tokenizer.model.decode_upsample_rate
     crop_start = ref_frames * samples_per_frame
     full_samples = total_frames * samples_per_frame
-    if args.mode == "customvoice":
-        wavs, rate = tokenizer.decode([{"audio_codes": codes.cuda()}])
-        wav = torch.from_numpy(wavs[0])
-    else:
-        decode_codes = codes if ref_codes is None else torch.cat([ref_codes.cpu(), codes])
-        decoded = tokenizer.model.decoder(decode_codes.T[None].to(tokenizer.device))[0, 0]
-        if decoded.numel() != full_samples:
-            raise ValueError("Continuous decoder length does not match the complete reference and generated codes")
+    decode_codes = codes if ref_codes is None else torch.cat([ref_codes.cpu(), codes])
+    decoded = tokenizer.model.decoder(decode_codes.T[None].to(tokenizer.device))[0, 0]
+    if decoded.numel() != full_samples:
+        raise ValueError("Continuous decoder length does not match the complete reference and generated codes")
+    if base:
         tensors["wav_full"] = cpu(decoded)
-        wav = decoded[crop_start:full_samples]
+    wav = decoded[crop_start:]
     if wav.numel() != frames * samples_per_frame:
         raise ValueError("Generated waveform length does not match the code-frame boundary")
 
@@ -236,7 +248,7 @@ def main() -> None:
             raise ValueError(f"Non-finite values in {name}")
     meta = {
         "text": args.text,
-        "speaker": args.speaker if args.mode == "customvoice" else "",
+        "speaker": speaker or "",
         "language": args.language,
         "seed": str(args.seed),
         "sample_rate": str(rate),
@@ -245,7 +257,7 @@ def main() -> None:
         "generate_kwargs": json.dumps(generate_kwargs, sort_keys=True),
         "talker_generate_kwargs": json.dumps(seen["talker_kwargs"], sort_keys=True),
         "predictor_generate_kwargs": json.dumps(seen["predictor_kwargs"], sort_keys=True),
-        "waveform_decoder": "public" if args.mode == "customvoice" else "continuous",
+        "waveform_decoder": "continuous",
         "codec_boundaries": json.dumps(
             {
                 "reference_frames": ref_frames,
@@ -269,6 +281,8 @@ def main() -> None:
             sort_keys=True,
         ),
     }
+    if args.instructions is not None:
+        meta["instructions"] = args.instructions
     if reference is not None:
         major, minor = torch.cuda.get_device_capability(model.device)
         meta.update(

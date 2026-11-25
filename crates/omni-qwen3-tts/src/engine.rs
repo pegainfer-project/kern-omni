@@ -34,12 +34,15 @@ use omni_engine::Extra;
 use omni_engine::Finish;
 use omni_engine::Handle;
 use omni_engine::Inbox;
+use omni_engine::Invalid;
 use omni_engine::Speech;
+use omni_engine::Submission;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::config::ModelType;
 use crate::model::Draw;
 use crate::model::Limits;
 use crate::model::Model;
@@ -79,20 +82,24 @@ pub fn frame_cap(input_chars: usize, model_max: usize) -> usize {
     (50 + 6 * input_chars).min(model_max)
 }
 
-/// The front end's view: CustomVoice speakers, languages, and a sampling seed.
+/// The front end's view: checkpoint-specific voices and instructions, languages,
+/// and a sampling seed. VoiceDesign's voice is entirely in `instructions`.
 pub fn info(model: &Model, name: &str, max_input_chars: usize) -> EngineInfo {
-    let t = &model.config.model.talker_config;
+    let config = &model.config;
+    let t = &config.model.talker_config;
+    let designed = config.model.tts_model_type == ModelType::VoiceDesign;
     let languages = std::iter::once("auto".to_string()).chain(t.codec_language_id.keys().cloned()).collect();
     EngineInfo {
         model: name.into(),
-        sample_rate: model.config.sample_rate,
-        voices: t.spk_id.keys().cloned().collect(),
+        sample_rate: config.sample_rate,
+        voices: if designed { Default::default() } else { t.spk_id.keys().cloned().collect() },
         extra: BTreeMap::from([
             ("language".to_string(), Extra::OneOf(languages)),
             ("seed".to_string(), Extra::Integer(0..=i64::MAX)),
         ]),
         speeds: 1.0..=1.0,
         max_input_chars,
+        required_instructions_max_chars: designed.then_some(512),
         reference_audio: None,
     }
 }
@@ -153,16 +160,18 @@ impl Engine {
         Self { model, opts, waiting: VecDeque::new(), running: Vec::new() }
     }
 
-    fn job(&self, speech: &Speech, sink: UnboundedSender<Event>) -> Result<Job, String> {
+    fn job(&self, speech: &Speech, sink: UnboundedSender<Event>) -> Result<Job, Invalid> {
         let m = &self.model;
         let language = speech.extra.get("language").and_then(|v| v.as_str()).unwrap_or("auto");
         let voice = prompt::voice(&m.config.model, &speech.voice, language)?;
         let instruct = speech.instructions.as_deref().filter(|s| !s.is_empty()).map(|s| m.tokenizer.instruct(s));
-        let prompt =
-            prompt::assemble(&m.config.model, voice, &m.tokenizer.assistant(&speech.input), instruct.as_deref());
-        if prompt.len() > self.opts.max_step_tokens {
-            return Err(format!("{} prompt tokens exceed the step's {}", prompt.len(), self.opts.max_step_tokens));
-        }
+        let prompt = prompt::assemble_with_budget(
+            &m.config.model,
+            voice,
+            &m.tokenizer.assistant(&speech.input),
+            instruct.as_deref(),
+            self.opts.max_step_tokens,
+        )?;
         let seed = speech.extra.get("seed").and_then(|v| v.as_u64()).unwrap_or_else(rand::random);
         Ok(Job {
             id: speech.id,
@@ -178,12 +187,24 @@ impl Engine {
         })
     }
 
-    fn enqueue(&mut self, speech: Speech, sink: UnboundedSender<Event>) {
+    fn enqueue(&mut self, submission: Submission) {
+        let Submission { speech, sink, admission } = submission;
+        if sink.is_closed() {
+            return;
+        }
         match self.job(&speech, sink.clone()) {
-            Ok(job) => self.waiting.push_back(job),
+            Ok(job) => {
+                if admission.is_none_or(|reply| reply.send(Ok(())).is_ok()) {
+                    self.waiting.push_back(job);
+                }
+            }
             Err(e) => {
                 tracing::warn!(id = speech.id, "rejected: {e}");
-                abort(&sink);
+                if let Some(reply) = admission {
+                    let _ = reply.send(Err(e));
+                } else {
+                    abort(&sink);
+                }
             }
         }
     }
@@ -290,6 +311,11 @@ pub fn start(
             let limits = Limits { max_batch: opts.max_batch, max_tokens: opts.max_step_tokens, kv_gib: opts.kv_gib };
             let model = Model::load(device, &dir, limits).with_context(|| format!("load {}", dir.display()))?;
             let (handle, inbox) = omni_engine::channel(info(&model, &name, max_input_chars), queue);
+            let handle = if model.config.model.tts_model_type == ModelType::VoiceDesign {
+                handle.with_admission_check()
+            } else {
+                handle
+            };
             anyhow::Ok((handle, inbox, Engine::new(model, opts)))
         })();
         match loaded {
@@ -316,13 +342,13 @@ fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {
                 return Ok(());
             }
             match inbox.rx.recv() {
-                Ok(s) => engine.enqueue(s.speech, s.sink),
+                Ok(s) => engine.enqueue(s),
                 Err(_) => return Ok(()),
             }
         }
         loop {
             match inbox.rx.try_recv() {
-                Ok(s) => engine.enqueue(s.speech, s.sink),
+                Ok(s) => engine.enqueue(s),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     open = false;

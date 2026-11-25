@@ -27,7 +27,7 @@ enum Command {
     SimLive(SimLiveArgs),
     /// Serve the CPU-only simulated image engine.
     SimImage(SimImageArgs),
-    /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
+    /// Serve Qwen3-TTS (12Hz CustomVoice or VoiceDesign) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
     /// Serve Higgs TTS 3 (4B) on one GPU.
@@ -72,6 +72,9 @@ struct SimArgs {
     /// Accept reference audio and transcripts in place of preset voices.
     #[arg(long)]
     reference_audio: bool,
+    /// Require a voice description in place of preset voices.
+    #[arg(long, conflicts_with = "reference_audio")]
+    instructions_required: bool,
     #[arg(long, default_value_t = 24_000)]
     sample_rate: u32,
     #[arg(long, default_value_t = 12.5)]
@@ -388,6 +391,7 @@ impl SimArgs {
         Profile {
             sample_rate: self.sample_rate,
             reference_audio: self.reference_audio,
+            instructions_required: self.instructions_required,
             frame_rate: self.frame_rate,
             frames_per_char: self.frames_per_char,
             max_frames: self.max_frames,

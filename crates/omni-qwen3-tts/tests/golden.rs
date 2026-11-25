@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use omni_qwen3_tts::config::ModelType;
 use omni_qwen3_tts::model::Draw;
 use omni_qwen3_tts::model::GROUPS;
 use omni_qwen3_tts::model::Limits;
@@ -31,6 +32,8 @@ struct Golden {
     text: String,
     speaker: String,
     language: String,
+    instructions: Option<String>,
+    model_type: ModelType,
 }
 
 impl Golden {
@@ -38,11 +41,18 @@ impl Golden {
         let bytes = std::fs::read(path).unwrap();
         let (_, meta) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
         let m = meta.metadata().clone().unwrap();
+        let model_type = match m.get("mode").map(String::as_str) {
+            None | Some("customvoice") => ModelType::CustomVoice,
+            Some("voicedesign") => ModelType::VoiceDesign,
+            Some(mode) => panic!("unsupported golden mode {mode}"),
+        };
         Golden {
             file: File::open(path).unwrap(),
             text: m["text"].clone(),
             speaker: m["speaker"].clone(),
             language: m["language"].clone(),
+            instructions: m.get("instructions").cloned(),
+            model_type,
         }
     }
 
@@ -86,11 +96,20 @@ fn matches_the_official_run() {
     let limits = Limits { max_batch: 3, max_tokens: 1024, kv_gib: 0.5 };
     let mut model = Model::load(0, &dir, limits).unwrap();
     let config = model.config.clone();
+    assert_eq!(config.model.tts_model_type, golden.model_type, "golden checkpoint family");
 
     let text_ids = model.tokenizer.assistant(&golden.text);
     assert_eq!(text_ids, golden.i32("text_ids"), "tokenizer ids");
     let voice = prompt::voice(&config.model, &golden.speaker, &golden.language).unwrap();
-    let prompt = prompt::assemble(&config.model, voice, &text_ids, None);
+    let instruct = if golden.model_type == ModelType::VoiceDesign {
+        let instructions = golden.instructions.as_deref().expect("VoiceDesign golden needs instructions");
+        let ids = model.tokenizer.instruct(instructions);
+        assert_eq!(ids, golden.i32("instruct_ids"), "instruction tokenizer ids");
+        Some(ids)
+    } else {
+        None
+    };
+    let prompt = prompt::assemble(&config.model, voice, &text_ids, instruct.as_deref());
     let (embed_shape, embeds) = golden.f32("prefill_embeds");
     assert_eq!(prompt.len(), embed_shape[0], "prompt length");
 
@@ -101,10 +120,19 @@ fn matches_the_official_run() {
     let t = &config.model.talker_config;
     let (h, vocab, p_vocab) = (t.stack.hidden_size, t.stack.vocab_size, t.code_predictor_config.vocab_size);
     let spf = config.samples_per_frame;
+    assert_eq!(talker_logits.len(), (n + 1) * vocab, "reference must include the terminal EOS-step logits");
+    assert_eq!(predictor_logits.len(), n * (GROUPS - 1) * p_vocab, "reference predictor logits per frame");
 
     let mut seqs: Vec<Seq> = (0..3).map(|_| model.open(prompt.len(), n + 1).unwrap().unwrap()).collect();
     let starts = [0, 0, LAG];
-    let draw = |t: usize| Draw { uniforms: [0.5; GROUPS], force: frames.get(t).copied() };
+    // CustomVoice's regression fixture draws EOS at u=0.5. VoiceDesign may
+    // end on a different draw, so replay its EOS and compare the raw logits.
+    let forced_end = (golden.model_type == ModelType::VoiceDesign).then(|| {
+        let mut end = [0; GROUPS];
+        end[0] = t.codec_eos_token_id;
+        end
+    });
+    let draw = |t: usize| Draw { uniforms: [0.5; GROUPS], force: frames.get(t).copied().or(forced_end) };
     let mut ours_talker = Vec::new();
     let mut ours_predictor = Vec::new();
     let mut wav = vec![Vec::new(); 3];

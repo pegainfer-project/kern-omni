@@ -49,6 +49,8 @@ pub struct Profile {
     pub sample_rate: u32,
     /// Accept reference conditioning in place of preset voices.
     pub reference_audio: bool,
+    /// Require a voice description in place of preset voices.
+    pub instructions_required: bool,
     /// Codec frames per second of audio.
     pub frame_rate: f64,
     /// Frames generated per input character at speed 1.0.
@@ -70,6 +72,7 @@ impl Default for Profile {
         Self {
             sample_rate: 24_000,
             reference_audio: false,
+            instructions_required: false,
             frame_rate: 12.5,
             frames_per_char: 0.8,
             max_frames: 4096,
@@ -125,7 +128,7 @@ impl Profile {
         EngineInfo {
             model: model.into(),
             sample_rate: self.sample_rate,
-            voices: if self.reference_audio {
+            voices: if self.reference_audio || self.instructions_required {
                 Default::default()
             } else {
                 VOICES.iter().map(|v| v.to_string()).collect()
@@ -133,6 +136,7 @@ impl Profile {
             extra: [("frames".to_string(), Extra::Integer(1..=self.max_frames as i64))].into(),
             speeds: 0.25..=4.0,
             max_input_chars: 4096,
+            required_instructions_max_chars: self.instructions_required.then_some(512),
             reference_audio: self.reference_audio.then_some(ReferenceAudioInfo {
                 sample_rate: 24_000,
                 duration_seconds: 1..=30,

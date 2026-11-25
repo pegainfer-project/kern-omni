@@ -27,7 +27,7 @@ sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
 
 The repository holds the serving front end, the engine contracts, CPU-only
 simulated engines used to load-test the front end, and four GPU engines:
-Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) and
+Qwen3-TTS-12Hz-1.7B CustomVoice and VoiceDesign ([docs/qwen3-tts.md](docs/qwen3-tts.md)) and
 Higgs TTS 3 ([docs/higgs-audio.md](docs/higgs-audio.md)) for speech, NVIDIA
 PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
 for full duplex: **128 concurrent live sessions on one GB300 with no playback
@@ -54,6 +54,10 @@ curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
   -d '{"model":"Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Hello from pega-omni.","voice":"ryan",
        "extra":{"language":"english"}}' -o hello.wav
 ```
+
+To describe the voice in natural language, use the
+`Qwen3-TTS-12Hz-1.7B-VoiceDesign` checkpoint with the same subcommand and pass
+`instructions` in the request. See the [VoiceDesign example](docs/qwen3-tts.md#voicedesign).
 
 Higgs TTS 3 (4B) serves the same route; control tags such as `<|emotion:elation|>` go inside
 `input`:

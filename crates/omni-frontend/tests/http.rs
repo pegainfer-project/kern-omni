@@ -13,7 +13,11 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream;
 use http_body_util::BodyExt;
+use omni_engine::Done;
+use omni_engine::Event;
+use omni_engine::Finish;
 use omni_engine::Inbox;
+use omni_engine::Invalid;
 use omni_engine::Reference;
 use omni_engine::ReferenceAudioInfo;
 use omni_engine::ReferenceMode;
@@ -24,7 +28,10 @@ use serde_json::json;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    let profile = Profile::default();
+    speech_app(Profile::default())
+}
+
+fn speech_app(profile: Profile) -> Router {
     let (handle, inbox) = omni_engine::channel(profile.info("sim"), 64);
     omni_sim::spawn(inbox, profile);
     omni_frontend::router(handle, None)
@@ -68,6 +75,54 @@ async fn pcm_accepts_a_voice_object_and_scales_with_speed() {
     let body = json!({ "model": "sim", "input": "a".repeat(10), "voice": { "id": "nova" }, "response_format": "pcm", "speed": 2.0 });
     let (status, mime, bytes) = post(&app, body).await;
     assert_eq!((status, mime.as_deref(), bytes.len()), (StatusCode::OK, Some("audio/pcm"), 4 * 3840));
+}
+
+#[tokio::test]
+async fn instruction_driven_engine_checks_the_description_and_ignores_voice() {
+    let app = speech_app(Profile { instructions_required: true, ..Profile::default() });
+    let resp = app.clone().oneshot(Request::get("/v1/audio/voices").body(Body::empty()).unwrap()).await.unwrap();
+    let voices: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(voices, json!({"voices": []}));
+
+    for instructions in [
+        None,
+        Some(json!(null)),
+        Some(json!("")),
+        Some(json!(" \t\n")),
+        Some(json!("慢".repeat(513))),
+        Some(json!(true)),
+        Some(json!(42)),
+        Some(json!(["slow"])),
+        Some(json!({"style": "slow"})),
+    ] {
+        let mut body = json!({"model": "sim", "input": "Hello.", "voice": "alloy"});
+        if let Some(instructions) = instructions {
+            body["instructions"] = instructions;
+        }
+        let (status, _, bytes) = post(&app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error(&bytes), ("invalid_request_error".into(), Some("instructions".into())));
+    }
+
+    for voice in [json!("alloy"), json!({"id": "not-a-preset"})] {
+        let body = json!({"model": "sim", "input": "Hello.", "voice": voice,
+                          "instructions": "A low, slow voice.", "extra": {"frames": 1}});
+        let (status, _, bytes) = post(&app, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(bytes.starts_with(b"RIFF"));
+    }
+}
+
+#[tokio::test]
+async fn preset_speech_accepts_null_or_verbatim_instructions() {
+    let (handle, inbox) = omni_engine::channel(Profile::default().info("sim"), 1);
+    let app = omni_frontend::router(handle, None);
+    for instructions in [None, Some(" A low, slow voice. ")] {
+        let body = json!({"model": "sim", "input": "Hello.", "voice": "alloy", "instructions": instructions});
+        let response = post_response(&app, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(inbox.rx.try_recv().unwrap().speech.instructions.as_deref(), instructions);
+    }
 }
 
 #[tokio::test]
@@ -143,6 +198,36 @@ async fn a_full_queue_is_429_not_a_wait() {
     let first = post_response(&app, body.clone()).await;
     let second = post_response(&app, body).await;
     assert_eq!((first.status(), second.status()), (StatusCode::OK, StatusCode::TOO_MANY_REQUESTS));
+}
+
+#[tokio::test]
+async fn engine_admission_errors_precede_audio_and_sse_responses() {
+    let (handle, inbox) = omni_engine::channel(Profile::default().info("sim"), 1);
+    let app = omni_frontend::router(handle.with_admission_check(), None);
+    let engine = std::thread::spawn(move || {
+        for param in ["instructions", "input"] {
+            let request = inbox.rx.recv().unwrap();
+            let error = Invalid { param, message: "prompt exceeds capacity".into() };
+            request.admission.unwrap().send(Err(error)).unwrap();
+        }
+        let request = inbox.rx.recv().unwrap();
+        request.admission.unwrap().send(Ok(())).unwrap();
+        request.sink.send(Event::Audio(Bytes::from_static(&[1, 0]))).unwrap();
+        request.sink.send(Event::Done(Done { finish: Finish::Complete, input_units: 1, frames: 1 })).unwrap();
+    });
+
+    let mut body =
+        json!({"model": "sim", "input": "Hi.", "voice": "alloy", "instructions": "Warm.", "response_format": "pcm"});
+    for (framing, param) in [("audio", "instructions"), ("sse", "input")] {
+        body["stream_format"] = json!(framing);
+        let (status, mime, bytes) = post(&app, body.clone()).await;
+        assert_eq!((status, mime.as_deref()), (StatusCode::BAD_REQUEST, Some("application/json")));
+        assert_eq!(error(&bytes), ("invalid_request_error".into(), Some(param.into())));
+    }
+    body["stream_format"] = json!("audio");
+    let (status, mime, bytes) = post(&app, body).await;
+    assert_eq!((status, mime.as_deref(), bytes.as_slice()), (StatusCode::OK, Some("audio/pcm"), &[1, 0][..]));
+    engine.join().unwrap();
 }
 
 #[tokio::test]

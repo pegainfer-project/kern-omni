@@ -6,9 +6,10 @@
 //!
 //! ```text
 //! [instruct…]  <|im_start|>assistant\n  pad…pad bos   text… eos   pad
-//!  -            -                        think… spk    pad… pad    bos
+//!  -            -                        think… [spk]  pad… pad    bos
 //! ```
 //!
+//! VoiceDesign omits the speaker position; its instruction describes the voice.
 //! After the prompt, every decode step's text track is `<tts_pad>`.
 
 use std::path::Path;
@@ -16,10 +17,12 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use omni_engine::Invalid;
 use serde_json::Value;
 use serde_json::json;
 
 use crate::config::Model;
+use crate::config::ModelType;
 
 /// No codec-track token at this position.
 pub const NO_CODEC: i32 = -1;
@@ -45,19 +48,28 @@ impl Prompt {
     }
 }
 
-/// A speaker's codec token and the language tag it speaks under.
+/// An optional preset speaker's codec token and the language tag it speaks under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Voice {
-    pub speaker: i32,
+    pub speaker: Option<i32>,
     pub language: Option<i32>,
 }
 
 /// Resolves a speaker and a language name (`auto` lets the model infer it). A
-/// dialect speaker asked for Chinese or `auto` speaks its dialect.
-pub fn voice(model: &Model, speaker: &str, language: &str) -> Result<Voice, String> {
+/// dialect speaker asked for Chinese or `auto` speaks its dialect. VoiceDesign
+/// ignores the speaker name and has no speaker token or dialect override.
+pub fn voice(model: &Model, speaker: &str, language: &str) -> Result<Voice, Invalid> {
     let t = &model.talker_config;
-    let speaker_id = *t.spk_id.get(speaker).ok_or_else(|| format!("unknown speaker `{speaker}`"))?;
-    let dialect = t.spk_is_dialect.get(speaker).and_then(Value::as_str);
+    let (speaker_id, dialect) = match model.tts_model_type {
+        ModelType::CustomVoice => {
+            let id = *t
+                .spk_id
+                .get(speaker)
+                .ok_or_else(|| Invalid { param: "voice", message: format!("unknown speaker `{speaker}`") })?;
+            (Some(id), t.spk_is_dialect.get(speaker).and_then(Value::as_str))
+        }
+        ModelType::VoiceDesign => (None, None),
+    };
     let language = match (language, dialect) {
         ("auto" | "chinese", Some(d)) => Some(d),
         ("auto", None) => None,
@@ -65,7 +77,11 @@ pub fn voice(model: &Model, speaker: &str, language: &str) -> Result<Voice, Stri
     };
     let language = match language {
         None => None,
-        Some(l) => Some(*t.codec_language_id.get(l).ok_or_else(|| format!("unknown language `{l}`"))?),
+        Some(l) => Some(
+            *t.codec_language_id
+                .get(l)
+                .ok_or_else(|| Invalid { param: "extra", message: format!("unknown language `{l}`") })?,
+        ),
     };
     Ok(Voice { speaker: speaker_id, language })
 }
@@ -80,7 +96,8 @@ pub fn assemble(model: &Model, voice: Voice, text: &[i32], instruct: Option<&[i3
         None => vec![t.codec_nothink_id, t.codec_think_bos_id, t.codec_think_eos_id],
         Some(l) => vec![t.codec_think_id, t.codec_think_bos_id, l, t.codec_think_eos_id],
     };
-    codec.extend([voice.speaker, t.codec_pad_id, t.codec_bos_id]);
+    codec.extend(voice.speaker);
+    codec.extend([t.codec_pad_id, t.codec_bos_id]);
 
     let mut p = Prompt::default();
     instruct.unwrap_or_default().iter().for_each(|&id| p.push(id, NO_CODEC));
@@ -92,6 +109,28 @@ pub fn assemble(model: &Model, voice: Voice, text: &[i32], instruct: Option<&[i3
     p.push(eos, t.codec_pad_id);
     p.push(pad, t.codec_bos_id);
     p
+}
+
+/// Checks the actual assembled positions, including the language and role tokens.
+/// Attribute overflow to the description only when the text would fit on its own.
+pub fn assemble_with_budget(
+    model: &Model,
+    voice: Voice,
+    text: &[i32],
+    instruct: Option<&[i32]>,
+    max_tokens: usize,
+) -> Result<Prompt, Invalid> {
+    let prompt = assemble(model, voice, text, instruct);
+    let total = prompt.len();
+    if total > max_tokens {
+        let input_tokens = total - instruct.map_or(0, <[i32]>::len);
+        let (param, tokens) = if input_tokens > max_tokens { ("input", input_tokens) } else { ("instructions", total) };
+        return Err(Invalid {
+            param,
+            message: format!("{tokens} prompt tokens exceed the per-step limit of {max_tokens}"),
+        });
+    }
+    Ok(prompt)
 }
 
 /// The Qwen2 byte-level BPE the checkpoint ships as `vocab.json` + `merges.txt`.

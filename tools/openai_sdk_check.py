@@ -7,6 +7,7 @@ work unchanged against the server, a client written for OpenAI works too.
 
 Any engine: voices come from `GET /v1/audio/voices`, `--extra` is passed through.
 Pass `--reference-audio` to check a server started with `sim --reference-audio`.
+Pass `--instructions` for VoiceDesign or `sim --instructions-required`.
 """
 
 import argparse
@@ -45,7 +46,9 @@ def main() -> None:
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="pega-omni-sim")
     ap.add_argument("--extra", type=json.loads, default={}, help="the request's `extra` object, as JSON")
-    ap.add_argument("--reference-audio", action="store_true", help="exercise reference conditioning on sim")
+    conditioning = ap.add_mutually_exclusive_group()
+    conditioning.add_argument("--reference-audio", action="store_true", help="exercise reference conditioning on sim")
+    conditioning.add_argument("--instructions", help="voice description for instruction-driven speech")
     args = ap.parse_args()
     client = openai.OpenAI(base_url=args.base_url, api_key="unused")
     voices = client.get("/audio/voices", cast_to=object)["voices"]
@@ -56,23 +59,31 @@ def main() -> None:
         reference = {**extra, "ref_audio": reference_wav_uri()}
         icl = {**reference, "ref_text": "A reference transcript."}
         audio_only = {**icl, "x_vector_only_mode": True}
+    elif args.instructions is not None:
+        assert voices == [], voices
+        voice = "nobody"  # The engine ignores a placeholder that is not a preset.
+        audio_only = icl = extra
     else:
         voice = voices[0]
         audio_only = icl = extra
 
-    wav = client.audio.speech.create(model=args.model, voice=voice, input="Hello from the SDK.", extra_body=audio_only)
+    instructions = {"instructions": args.instructions} if args.instructions is not None else {}
+    wav = client.audio.speech.create(
+        model=args.model, voice=voice, input="Hello from the SDK.", extra_body=audio_only, **instructions
+    )
     data = wav.read()
     riff, _, wave_tag = struct.unpack("<4sI4s", data[:12])
     assert (riff, wave_tag) == (b"RIFF", b"WAVE") and len(data) > 44, (riff, wave_tag, len(data))
 
     with client.audio.speech.with_streaming_response.create(
-        model=args.model, voice=voice, input="Streaming.", response_format="pcm", extra_body=icl
+        model=args.model, voice=voice, input="Streaming.", response_format="pcm", extra_body=icl, **instructions
     ) as resp:
         pcm = sum(len(c) for c in resp.iter_bytes())
     assert pcm > 0 and pcm % 2 == 0, pcm
 
     with client.audio.speech.with_streaming_response.create(
-        model=args.model, voice=voice, input="Events.", response_format="pcm", stream_format="sse", extra_body=icl
+        model=args.model, voice=voice, input="Events.", response_format="pcm", stream_format="sse", extra_body=icl,
+        **instructions,
     ) as resp:
         events = [json.loads(line[6:]) for line in resp.iter_lines() if line.startswith("data: ")]
     audio = sum(len(base64.b64decode(e["audio"])) for e in events if e["type"] == "speech.audio.delta")
@@ -83,6 +94,10 @@ def main() -> None:
         assert_bad_request(client, args.model, voice, "ref_text", reference)
         malformed = {**audio_only, "ref_audio": "data:audio/wav;base64"}
         assert_bad_request(client, args.model, voice, "ref_audio", malformed)
+    elif args.instructions is not None:
+        assert_bad_request(client, args.model, voice, "instructions", extra)
+        for description in (None, "", " \t\n", "慢" * 513, True, 42, ["slow"], {"style": "slow"}):
+            assert_bad_request(client, args.model, voice, "instructions", {**extra, "instructions": description})
     else:
         assert_bad_request(client, args.model, "nobody", "voice")
 
@@ -93,8 +108,8 @@ def main() -> None:
         assert e.body["code"] == "model_not_found", e.body
 
     assert [m.id for m in client.models.list()] == [args.model]
-    reference_result = ", reference audio" if args.reference_audio else ""
-    print(f"openai {openai.__version__}: wav, pcm stream, sse stream, errors and models{reference_result} all conform")
+    result = ", reference audio" if args.reference_audio else ", voice descriptions" if instructions else ""
+    print(f"openai {openai.__version__}: wav, pcm stream, sse stream, errors and models{result} all conform")
 
 
 if __name__ == "__main__":
