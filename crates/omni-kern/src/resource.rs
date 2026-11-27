@@ -59,11 +59,19 @@ pub fn open(rt: &mut Runtime, tokens: usize, budget: &Budget, pad: &Pad) -> Resu
         Err(kern_runtime::Error::Denied(d)) => return Ok(Err(d)),
         Err(e) => return Err(e.into()),
     };
-    if rt.pages_used() > budget.pages {
-        let alone = lease.page_ids().len() + pad.pages().len();
-        return Ok(Err(if alone > budget.pages { Denied::ExceedsPool } else { Denied::Busy }));
+    if let Err(d) = admit(rt.pages_used(), lease.page_ids().len(), pad.pages().len(), budget) {
+        return Ok(Err(d));
     }
     Ok(Ok(lease))
+}
+
+/// The `Busy`/`ExceedsPool` decision for a lease that is already taken: a
+/// pool over budget is only `Busy` when this lease could fit on its own.
+pub fn admit(used: usize, lease_pages: usize, pad_pages: usize, budget: &Budget) -> std::result::Result<(), Denied> {
+    if used <= budget.pages {
+        return Ok(());
+    }
+    Err(if lease_pages + pad_pages > budget.pages { Denied::ExceedsPool } else { Denied::Busy })
 }
 
 /// The rows of a paged call: one token position each, with the page table
