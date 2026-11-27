@@ -183,7 +183,11 @@ impl Model {
         let kernels = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;
         let cache_pages = PREFIX_CACHE_SLOTS * PREFIX_CACHE_MAX_LEN.div_ceil(PAGE);
         let tokens = ((limits.max_sessions * PAGES + cache_pages + 1) * PAGE) as u64;
-        let capacity = Capacity { tokens: Some(tokens), seqs: (limits.max_sessions + 1 + PREFIX_CACHE_SLOTS) as u64 };
+        let capacity = Capacity {
+            tokens: Some(tokens),
+            slots: (limits.max_sessions + 1 + PREFIX_CACHE_SLOTS) as u64,
+            landings: 0,
+        };
         let mut rt = Runtime::load(&verified, Some(&kernels), device, Some(capacity), None)?;
         rt.load_weights(&tensors)?;
         let pad = rt.lease(1)?;
@@ -620,7 +624,7 @@ fn generate(
         .map(|(n, sha, _)| ((*n).into(), json!({"source": format!("{n}-{}.cubin", &sha[..12]), "sha256": sha})))
         .collect();
     let manifest = json!({
-        "schema_version": 5,
+        "schema_version": 7,
         "model": "personaplex-7b",
         "vars": {"seqs": {"max": max_seqs}, "tokens": {"max": max_prefill.max(max_seqs)}},
         "states": states,

@@ -31,7 +31,8 @@ check belongs in CI.
   shell, `engine.rs` the scheduler. `tests/golden.rs` is the correctness
   oracle.
 - `crates/omni-kern`: what the GPU engines share: the manifest builder
-  (`Gen`), weight loading, `common.cuh`.
+  (`Gen`), the paged-state resource helpers (`Budget`, `Pad`, `Rows`),
+  weight loading, `common.cuh`.
 - `crates/omni-higgs-audio`: Higgs TTS 3 (4B) as one generated kern manifest. `model.rs` emits the programs (the Qwen3 body
   through `omni-qwen3`) and is the runtime shell, `codec.rs` the codec decoder,
   `kernels/higgs.cu` and `kernels/codec.cu` the kernels they launch, `delay.rs` the delay pattern

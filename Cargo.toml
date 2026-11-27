@@ -55,11 +55,11 @@ half = "2"
 # The model runs as a kern manifest: kern-manifest is its schema and verifier,
 # kern-runtime executes it (graphs per batch bucket, paged KV and per-sequence
 # state slots from kern-pool).
-kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "b43bb5a680d6fc92f969a7881e1ceca98c301607" }
-kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "b43bb5a680d6fc92f969a7881e1ceca98c301607" }
-kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "b43bb5a680d6fc92f969a7881e1ceca98c301607" }
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "041b2af69b544a5adb520dd81eef010bd1e33f1d" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "041b2af69b544a5adb520dd81eef010bd1e33f1d" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "041b2af69b544a5adb520dd81eef010bd1e33f1d" }
 # The cuBLASLt kern-runtime builds on, for listing GEMM algorithms.
-cudarc = { version = "=0.19.7", features = ["cuda-13000"] }
+cudarc = { version = "=0.19.10", features = ["cuda-13030"] }
 hdrhistogram = "7"
 http-body-util = "0.1"
 memmap2 = "0.9"

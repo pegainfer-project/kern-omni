@@ -204,7 +204,7 @@ impl Engine {
                     self.running.push(job);
                     admitted += 1;
                 }
-                Err(Denied::Busy | Denied::Remapping) => break,
+                Err(Denied::Busy) => break,
                 Err(d) => {
                     let job = self.waiting.pop_front().expect("front exists");
                     tracing::warn!(
