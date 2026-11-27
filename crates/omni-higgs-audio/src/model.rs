@@ -13,7 +13,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use kern_pool::Denied;
@@ -35,6 +34,10 @@ use omni_kern::ini;
 use omni_kern::ints;
 use omni_kern::kernels_dir;
 use omni_kern::outb;
+use omni_kern::resource;
+use omni_kern::resource::Budget;
+use omni_kern::resource::Pad;
+use omni_kern::resource::Rows as KvRows;
 use omni_kern::state_in;
 use omni_kern::state_io;
 use omni_kern::stride;
@@ -119,10 +122,9 @@ pub struct Out {
 pub struct Model {
     pub tokenizer: Tokenizer,
     rt: Runtime,
-    pad: Lease,
+    pad: Pad,
     limits: Limits,
-    /// The most pages the running sequences may hold.
-    pages_max: usize,
+    budget: Budget,
 }
 
 impl Model {
@@ -130,35 +132,27 @@ impl Model {
         let stack = config::load(dir)?;
         let tokenizer = Tokenizer::load(dir)?;
         let max_seqs = bucket(limits.max_batch);
-        let kv_tokens = (limits.kv_gib * (1u64 << 30) as f64) as usize / kv_bytes_per_token(&stack);
-        let pages_max = kv_tokens.div_ceil(PAGE) + 1;
+        let budget = Budget::new(limits.kv_gib, kv_bytes_per_token(&stack), PAGE, max_seqs);
         let cubins = [("codec", CODEC), ("higgs", HIGGS), ("qwen3", omni_qwen3::CUBIN)]
             .map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
-        // Each padding row of a graph call names the pad lease's page once more.
-        let page_table = pages_max + max_seqs;
-        let (manifest, tensors) = generate(dir, &stack, &cubins, limits, max_seqs, page_table)?;
+        let (manifest, tensors) = generate(dir, &stack, &cubins, limits, max_seqs, budget.page_table)?;
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let dir = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;
-        let capacity = Capacity { tokens: Some(kv_tokens as u64), seqs: limits.max_batch as u64 + 1 };
+        let capacity = Capacity { tokens: Some(budget.tokens as u64), slots: limits.max_batch as u64 + 1, landings: 0 };
         let mut rt = Runtime::load(&verified, Some(&dir), device, Some(capacity), None)?;
         rt.load_weights(&tensors)?;
-        let pad = rt.lease(1)?;
-        Ok(Self { tokenizer, rt, pad, limits, pages_max })
+        let pad = Pad::new(&mut rt)?;
+        Ok(Self { tokenizer, rt, pad, limits, budget })
     }
 
-    /// A sequence of a `prompt`-token prompt and up to `rows` rows, or why not: `Busy` and
-    /// `Remapping` pass, the rest never will.
+    /// A sequence of a `prompt`-token prompt and up to `rows` rows, or why not: `Busy`
+    /// passes, the rest never will.
     pub fn open(&mut self, prompt: usize, rows: usize) -> Result<Result<Seq, Denied>> {
-        let lease = match self.rt.lease(prompt + rows) {
+        let lease = match resource::open(&mut self.rt, prompt + rows, &self.budget, &self.pad)? {
             Ok(l) => l,
-            Err(kern_runtime::Error::Denied(d)) => return Ok(Err(d)),
-            Err(e) => return Err(e.into()),
+            Err(d) => return Ok(Err(d)),
         };
-        if self.rt.pages_used() > self.pages_max {
-            let alone = lease.page_ids().len() + self.pad.page_ids().len();
-            return Ok(Err(if alone > self.pages_max { Denied::ExceedsPool } else { Denied::Busy }));
-        }
         Ok(Ok(Seq { lease, prompt, rows: 0, delay: Delay::default() }))
     }
 
@@ -174,7 +168,7 @@ impl Model {
             ensure!(seq.rows == 0 && prompt.len() == seq.prompt, "sequence {s} is not fresh");
             t.ids.extend(*prompt);
             t.push_seq(&seq.lease, 0..prompt.len(), s);
-            last_row.push(t.pos.len() as i32 - 1);
+            last_row.push(t.kv.pos.len() as i32 - 1);
         }
         let v = vars(tokens, n);
         t.write(&mut self.rt, &v, true)?;
@@ -203,7 +197,7 @@ impl Model {
     fn graph_inputs(&mut self, steps: &[Step], body: bool) -> Result<()> {
         let b = bucket(steps.len());
         let draw = Draw { uniforms: [0.5; CODEBOOKS], force: None };
-        let pad = Step { lease: &self.pad, position: 0, draw, force: [-1; CODEBOOKS] };
+        let pad = Step { lease: self.pad.lease(), position: 0, draw, force: [-1; CODEBOOKS] };
         let padded: Vec<&Step> = steps.iter().chain(std::iter::repeat(&pad)).take(b).collect();
         let lines = padded.iter().map(|f| f.lease.seq_line("lines", 0)).collect::<Result<Vec<_>, _>>()?;
         let uniforms: Vec<u8> = padded.iter().flat_map(|f| f.draw.uniforms).flat_map(f32::to_le_bytes).collect();
@@ -278,37 +272,19 @@ fn finish<'a>(seqs: impl Iterator<Item = &'a mut Seq>, out: &mut Out) {
 #[derive(Default)]
 struct Rows {
     ids: Vec<i32>,
-    pos: Vec<i32>,
-    slot: Vec<i32>,
-    seq: Vec<i32>,
-    indptr: Vec<i32>,
-    pages: Vec<i32>,
+    kv: KvRows,
 }
 
 impl Rows {
     fn push_seq(&mut self, lease: &Lease, positions: std::ops::Range<usize>, s: usize) {
-        if self.indptr.is_empty() {
-            self.indptr.push(0);
-        }
-        for p in positions {
-            self.pos.push(p as i32);
-            self.slot.push(lease.slot(p) as i32);
-            self.seq.push(s as i32);
-        }
-        self.pages.extend(lease.page_ids());
-        self.indptr.push(self.pages.len() as i32);
+        self.kv.push_seq(lease, positions, s);
     }
 
     fn write(&self, rt: &mut Runtime, v: &BTreeMap<String, u64>, prompt: bool) -> Result<()> {
         if prompt {
             rt.write_input_at("t_ids", &ints(&self.ids), v)?;
         }
-        rt.write_input_at("t_pos", &ints(&self.pos), v)?;
-        rt.write_input_at("t_slot", &ints(&self.slot), v)?;
-        rt.write_input_at("t_seq", &ints(&self.seq), v)?;
-        rt.write_input_at("kv_indptr", &ints(&self.indptr), v)?;
-        rt.write_input_at("kv_pages", &ints(&self.pages), v).context("kv_pages")?;
-        Ok(())
+        self.kv.write(rt, v)
     }
 }
 
@@ -458,7 +434,7 @@ fn generate(
         .map(|(n, sha, _)| ((*n).into(), json!({"source": format!("{n}-{}.cubin", &sha[..12]), "sha256": sha})))
         .collect();
     let manifest = json!({
-        "schema_version": 5,
+        "schema_version": 7,
         "model": "higgs-tts-3",
         "vars": {
             "seqs": {"max": max_seqs},

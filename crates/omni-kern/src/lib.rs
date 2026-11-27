@@ -25,6 +25,7 @@ use kern_runtime::Tensors;
 use serde_json::Value;
 use serde_json::json;
 
+pub mod resource;
 pub mod weights;
 
 /// Batch sizes a graph is captured at; a call pads up to the next one.

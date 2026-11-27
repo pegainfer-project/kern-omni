@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 half.workspace = true
 kern-manifest.workspace = true
+kern-pool.workspace = true
 kern-runtime.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true

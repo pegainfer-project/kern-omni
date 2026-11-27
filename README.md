@@ -169,7 +169,7 @@ uv run --with openai tools/openai_sdk_check.py --reference-audio
 | `omni-engine` | the contracts: `Speech`, `Event`, `Handle` / `Inbox`; `live`: sessions, the jitter buffer, the clock and `drive`, the loop every live engine runs; `image`: `Generation`, its `Event`, `Handle` / `Inbox` |
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, PNG, metrics |
 | `omni-sim` | the simulated engines (speech, live and image): pure cores plus thread shells |
-| `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
+| `omni-kern` | the kern manifest builder, paged-state resource helpers, weight loading and CUDA helpers the GPU engines share |
 | `omni-qwen3` | the Qwen3 decoder stack as manifest calls over paged or dense KV, and its CUDA kernels; Qwen3-TTS and Higgs TTS build on it |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-higgs-audio` | Higgs TTS 3 as one kern manifest (Qwen3 body, fused 8-codebook head and draws, folded-quantizer DAC codec decoder, own CUDA kernels), delay pattern, prompt, engine |

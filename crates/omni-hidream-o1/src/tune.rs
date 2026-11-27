@@ -72,7 +72,7 @@ fn largest_class(
     let mut classes: Vec<(Vec<u8>, Vec<GemmAlgo>)> = Vec::new();
     for algo in algos {
         let manifest = json!({
-            "schema_version": 5, "model": "hidream-o1-gemm-probe", "vars": {"rows": {"max": max_rows}}, "states": {},
+            "schema_version": 7, "model": "hidream-o1-gemm-probe", "vars": {"rows": {"max": max_rows}}, "states": {},
             "buffers": {
                 "a": {"kind": "input", "dtype": "bf16", "shape": ["rows", k]},
                 "w": {"kind": "input", "dtype": "bf16", "shape": [n, k]},
@@ -88,7 +88,13 @@ fn largest_class(
             ]}]}}
         });
         let verified = kern_manifest::Verified::from_json(&manifest.to_string()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut rt = match Runtime::load(&verified, None, ordinal, Some(Capacity { tokens: Some(1), seqs: 1 }), None) {
+        let mut rt = match Runtime::load(
+            &verified,
+            None,
+            ordinal,
+            Some(Capacity { tokens: Some(1), slots: 1, landings: 0 }),
+            None,
+        ) {
             Ok(rt) => rt,
             Err(e) => {
                 tracing::info!(?algo, "left out: {e}");

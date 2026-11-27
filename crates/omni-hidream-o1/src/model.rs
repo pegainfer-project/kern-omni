@@ -109,8 +109,13 @@ impl Model {
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let kernels = kernels_dir(&[("hidream", &sha, HIDREAM)])?;
-        let mut rt =
-            Runtime::load(&verified, Some(&kernels), device, Some(Capacity { tokens: Some(1), seqs: 1 }), None)?;
+        let mut rt = Runtime::load(
+            &verified,
+            Some(&kernels),
+            device,
+            Some(Capacity { tokens: Some(1), slots: 1, landings: 0 }),
+            None,
+        )?;
         rt.load_weights(&tensors)?;
         let picks = gemms.vars().into_keys().map(|v| (v, 1)).collect();
         Ok(Self { cfg, rt, limits, grid: (0, 0), picks })
@@ -630,7 +635,7 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
         json!({"text": {"max": max_text}, "patches": {"max": max_patches}, "rows": {"max": max_patches + 1}});
     vars.as_object_mut().expect("an object").extend(gemms.vars());
     let manifest = json!({
-        "schema_version": 5,
+        "schema_version": 7,
         "model": "hidream-o1",
         "vars": vars,
         "states": {},
