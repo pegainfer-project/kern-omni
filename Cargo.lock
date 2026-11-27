@@ -1798,6 +1798,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "half",
  "kern-manifest",
  "kern-pool",
  "kern-runtime",
@@ -1806,6 +1807,7 @@ dependencies = [
  "omni-qwen3",
  "proptest",
  "rand 0.10.3",
+ "realfft",
  "safetensors",
  "serde",
  "serde_json",

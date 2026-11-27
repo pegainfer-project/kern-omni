@@ -8,8 +8,10 @@
 mod codec;
 pub mod config;
 pub mod engine;
+pub mod mel;
 pub mod model;
 pub mod prompt;
+pub mod speaker_encoder;
 mod talker;
 
 pub use omni_kern::weights;

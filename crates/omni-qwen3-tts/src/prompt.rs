@@ -1,33 +1,46 @@
 //! The talker's prompt: text tokens and the dual-track sequence built from them.
 //!
 //! Every prompt position carries a text-track token, projected through the
-//! talker's text MLP, and optionally a codec-track token added on top. The
-//! layout is the official non-streaming one (the whole text is known up front):
+//! talker's text MLP, and optionally a codec-track embedding added on top.
+//! The layout is the official non-streaming one (the whole text is known up front):
 //!
 //! ```text
 //! [instruct…]  <|im_start|>assistant\n  pad…pad bos   text… eos   pad
 //!  -            -                        think… spk    pad… pad    bos
 //! ```
 //!
-//! After the prompt, every decode step's text track is `<tts_pad>`.
+//! The speaker position holds a codec token for CustomVoice and a continuous
+//! x-vector for Base. After the prompt, every decode step's text track is
+//! `<tts_pad>`.
 
 use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
 use serde_json::Value;
 use serde_json::json;
 
 use crate::config::Model;
+use crate::config::TtsModelType;
 
 /// No codec-track token at this position.
 pub const NO_CODEC: i32 = -1;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The contribution added to a row's projected text. Reference codec frames
+/// can be represented here by their full set of codebook IDs when ICL is added.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Codec {
+    None,
+    Token(i32),
+    Speaker(Vec<f32>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prompt {
-    pub text: Vec<i32>,
-    pub codec: Vec<i32>,
+    pub(crate) text: Vec<i32>,
+    pub(crate) codec: Vec<Codec>,
 }
 
 impl Prompt {
@@ -39,7 +52,7 @@ impl Prompt {
         self.text.is_empty()
     }
 
-    fn push(&mut self, text: i32, codec: i32) {
+    fn push(&mut self, text: i32, codec: Codec) {
         self.text.push(text);
         self.codec.push(codec);
     }
@@ -63,34 +76,57 @@ pub fn voice(model: &Model, speaker: &str, language: &str) -> Result<Voice, Stri
         ("auto", None) => None,
         (l, _) => Some(l),
     };
-    let language = match language {
-        None => None,
-        Some(l) => Some(*t.codec_language_id.get(l).ok_or_else(|| format!("unknown language `{l}`"))?),
-    };
-    Ok(Voice { speaker: speaker_id, language })
+    Ok(Voice { speaker: speaker_id, language: language_id(model, language)? })
+}
+
+fn language_id(model: &Model, language: Option<&str>) -> Result<Option<i32>, String> {
+    language
+        .map(|l| model.talker_config.codec_language_id.get(l).copied().ok_or_else(|| format!("unknown language `{l}`")))
+        .transpose()
 }
 
 /// Lays out the prompt for `text` (the template-tokenized text, see
 /// [`Tokenizer::assistant`]) and an optional instruction (see
 /// [`Tokenizer::instruct`]).
 pub fn assemble(model: &Model, voice: Voice, text: &[i32], instruct: Option<&[i32]>) -> Prompt {
+    assemble_with_speaker(model, Codec::Token(voice.speaker), voice.language, text, instruct)
+}
+
+/// Assembles Base's x-vector-only prompt for template-tokenized target text
+/// (see [`Tokenizer::assistant`]) and its target language (`auto` or a model
+/// language name). The speaker vector is added at the usual speaker position.
+pub fn assemble_base(model: &Model, speaker_embedding: Vec<f32>, language: &str, text: &[i32]) -> Result<Prompt> {
+    ensure!(matches!(model.tts_model_type, TtsModelType::Base { .. }), "x-vector prompt requires a Base checkpoint");
+    let hidden = model.talker_config.stack.hidden_size;
+    ensure!(speaker_embedding.len() == hidden, "expected {hidden} speaker values, got {}", speaker_embedding.len());
+    ensure!(speaker_embedding.iter().all(|x| x.is_finite()), "speaker values must be finite");
+    let language = language.to_ascii_lowercase();
+    let language = language_id(model, (language != "auto").then_some(language.as_str())).map_err(anyhow::Error::msg)?;
+    Ok(assemble_with_speaker(model, Codec::Speaker(speaker_embedding), language, text, None))
+}
+
+fn assemble_with_speaker(
+    model: &Model,
+    speaker: Codec,
+    language: Option<i32>,
+    text: &[i32],
+    instruct: Option<&[i32]>,
+) -> Prompt {
     let t = &model.talker_config;
     let (bos, eos, pad) = (model.tts_bos_token_id, model.tts_eos_token_id, model.tts_pad_token_id);
-    let mut codec: Vec<i32> = match voice.language {
-        None => vec![t.codec_nothink_id, t.codec_think_bos_id, t.codec_think_eos_id],
-        Some(l) => vec![t.codec_think_id, t.codec_think_bos_id, l, t.codec_think_eos_id],
-    };
-    codec.extend([voice.speaker, t.codec_pad_id, t.codec_bos_id]);
-
     let mut p = Prompt::default();
-    instruct.unwrap_or_default().iter().for_each(|&id| p.push(id, NO_CODEC));
-    text[..3].iter().for_each(|&id| p.push(id, NO_CODEC));
-    for (i, &c) in codec[..codec.len() - 1].iter().enumerate() {
-        p.push(if i + 2 < codec.len() { pad } else { bos }, c);
+    instruct.unwrap_or_default().iter().chain(&text[..3]).for_each(|&id| p.push(id, Codec::None));
+    p.push(pad, Codec::Token(if language.is_some() { t.codec_think_id } else { t.codec_nothink_id }));
+    p.push(pad, Codec::Token(t.codec_think_bos_id));
+    if let Some(id) = language {
+        p.push(pad, Codec::Token(id));
     }
-    text[3..text.len() - 5].iter().for_each(|&id| p.push(id, t.codec_pad_id));
-    p.push(eos, t.codec_pad_id);
-    p.push(pad, t.codec_bos_id);
+    p.push(pad, Codec::Token(t.codec_think_eos_id));
+    p.push(pad, speaker);
+    p.push(bos, Codec::Token(t.codec_pad_id));
+    text[3..text.len() - 5].iter().for_each(|&id| p.push(id, Codec::Token(t.codec_pad_id)));
+    p.push(eos, Codec::Token(t.codec_pad_id));
+    p.push(pad, Codec::Token(t.codec_bos_id));
     p
 }
 

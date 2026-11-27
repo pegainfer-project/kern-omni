@@ -9,6 +9,14 @@
 //! request keeping its decoder state), so a chunk's size decides only when
 //! audio leaves, not what it costs.
 //!
+//! Base references wait outside admission: at most one checked PCM reference
+//! and `max_batch` prepared prompts are held internally, with their combined
+//! count also capped at `max_batch`. After decoding and emitting a tick, at
+//! most one reference (30 seconds, 2,812 mel frames) is normalized, converted
+//! to mel and speaker-encoded. The submission channel holds at most eight
+//! more references, bounding queued PCM16 to 12.96 MB. No Talker state or KV
+//! is leased until that preparation finishes.
+//!
 //! Admission leases a request's whole KV and its state slot up front, the KV
 //! sized by its frame cap (proportional to the input length), so a running
 //! request never waits for memory and nothing is ever preempted.
@@ -22,6 +30,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::TryRecvError;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -34,12 +43,16 @@ use omni_engine::Extra;
 use omni_engine::Finish;
 use omni_engine::Handle;
 use omni_engine::Inbox;
+use omni_engine::ReferenceAudioInfo;
 use omni_engine::Speech;
+use omni_engine::Submission;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::config::TtsModelType;
+use crate::mel;
 use crate::model::Draw;
 use crate::model::Limits;
 use crate::model::Model;
@@ -47,6 +60,9 @@ use crate::model::Out;
 use crate::model::Seq;
 use crate::prompt;
 use crate::prompt::Prompt;
+use crate::speaker_encoder::SpeakerEncoder;
+
+const REFERENCE_MAX_SECONDS: u32 = 30;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -79,21 +95,32 @@ pub fn frame_cap(input_chars: usize, model_max: usize) -> usize {
     (50 + 6 * input_chars).min(model_max)
 }
 
-/// The front end's view: CustomVoice speakers, languages, and a sampling seed.
+/// The checkpoint's speakers or reference capability, languages and sampling seed.
 pub fn info(model: &Model, name: &str, max_input_chars: usize) -> EngineInfo {
     let t = &model.config.model.talker_config;
     let languages = std::iter::once("auto".to_string()).chain(t.codec_language_id.keys().cloned()).collect();
     EngineInfo {
         model: name.into(),
         sample_rate: model.config.sample_rate,
-        voices: t.spk_id.keys().cloned().collect(),
+        voices: match &model.config.model.tts_model_type {
+            TtsModelType::CustomVoice => t.spk_id.keys().cloned().collect(),
+            TtsModelType::Base { .. } => Default::default(),
+        },
         extra: BTreeMap::from([
             ("language".to_string(), Extra::OneOf(languages)),
             ("seed".to_string(), Extra::Integer(0..=i64::MAX)),
         ]),
         speeds: 1.0..=1.0,
         max_input_chars,
-        reference_audio: None,
+        reference_audio: match &model.config.model.tts_model_type {
+            TtsModelType::CustomVoice => None,
+            TtsModelType::Base { speaker_encoder_config } => Some(ReferenceAudioInfo {
+                sample_rate: speaker_encoder_config.sample_rate,
+                duration_seconds: 1..=REFERENCE_MAX_SECONDS,
+                audio_only: true,
+                with_transcript: false,
+            }),
+        },
     }
 }
 
@@ -134,6 +161,8 @@ impl Job {
 pub struct Engine {
     model: Model,
     opts: Options,
+    speaker_encoder: Option<SpeakerEncoder>,
+    pending: Option<Submission>,
     waiting: VecDeque<Job>,
     running: Vec<Job>,
 }
@@ -150,16 +179,25 @@ fn abort(sink: &UnboundedSender<Event>) {
 
 impl Engine {
     pub fn new(model: Model, opts: Options) -> Self {
-        Self { model, opts, waiting: VecDeque::new(), running: Vec::new() }
+        Self { model, opts, speaker_encoder: None, pending: None, waiting: VecDeque::new(), running: Vec::new() }
     }
 
-    fn job(&self, speech: &Speech, sink: UnboundedSender<Event>) -> Result<Job, String> {
+    /// A Base engine owns a standalone encoder on the same GPU thread as its model.
+    pub fn with_speaker_encoder(model: Model, opts: Options, speaker_encoder: SpeakerEncoder) -> Self {
+        Self { speaker_encoder: Some(speaker_encoder), ..Self::new(model, opts) }
+    }
+
+    fn job(&self, speech: &Speech, speaker: Option<Vec<f32>>, sink: UnboundedSender<Event>) -> Result<Job, String> {
         let m = &self.model;
         let language = speech.extra.get("language").and_then(|v| v.as_str()).unwrap_or("auto");
-        let voice = prompt::voice(&m.config.model, &speech.voice, language)?;
-        let instruct = speech.instructions.as_deref().filter(|s| !s.is_empty()).map(|s| m.tokenizer.instruct(s));
-        let prompt =
-            prompt::assemble(&m.config.model, voice, &m.tokenizer.assistant(&speech.input), instruct.as_deref());
+        let text = m.tokenizer.assistant(&speech.input);
+        let prompt = if let Some(speaker) = speaker {
+            prompt::assemble_base(&m.config.model, speaker, language, &text).map_err(|e| e.to_string())?
+        } else {
+            let voice = prompt::voice(&m.config.model, &speech.voice, language)?;
+            let instruct = speech.instructions.as_deref().filter(|s| !s.is_empty()).map(|s| m.tokenizer.instruct(s));
+            prompt::assemble(&m.config.model, voice, &text, instruct.as_deref())
+        };
         if prompt.len() > self.opts.max_step_tokens {
             return Err(format!("{} prompt tokens exceed the step's {}", prompt.len(), self.opts.max_step_tokens));
         }
@@ -179,7 +217,22 @@ impl Engine {
     }
 
     fn enqueue(&mut self, speech: Speech, sink: UnboundedSender<Event>) {
-        match self.job(&speech, sink.clone()) {
+        if sink.is_closed() {
+            return;
+        }
+        if speech.reference.is_some() {
+            debug_assert!(self.pending.is_none());
+            self.pending = Some(Submission { speech, sink });
+            return;
+        }
+        self.enqueue_prepared(speech, None, sink);
+    }
+
+    fn enqueue_prepared(&mut self, speech: Speech, speaker: Option<Vec<f32>>, sink: UnboundedSender<Event>) {
+        if sink.is_closed() {
+            return;
+        }
+        match self.job(&speech, speaker, sink.clone()) {
             Ok(job) => self.waiting.push_back(job),
             Err(e) => {
                 tracing::warn!(id = speech.id, "rejected: {e}");
@@ -188,11 +241,72 @@ impl Engine {
         }
     }
 
+    fn waiting(&self) -> usize {
+        self.waiting.len() + usize::from(self.pending.is_some())
+    }
+
+    fn can_receive(&self) -> bool {
+        self.pending.is_none() && self.waiting() < self.opts.max_batch.max(1)
+    }
+
+    fn cancel(&mut self) {
+        if self.pending.as_ref().is_some_and(|s| s.sink.is_closed()) {
+            self.pending = None;
+        }
+        self.waiting.retain(|j| !j.sink.is_closed());
+        self.running.retain(|j| !j.sink.is_closed());
+    }
+
+    /// The full reference is one ECAPA input: its gating and attentive pooling
+    /// use global statistics, so splitting it into independent chunks is invalid.
+    fn prepare(&mut self) -> Result<()> {
+        let Some(Submission { mut speech, sink }) = self.pending.take() else {
+            return Ok(());
+        };
+        if sink.is_closed() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let reference = speech.reference.take().expect("checked reference request");
+        let pcm: Vec<f32> =
+            reference.pcm.as_chunks::<2>().0.iter().map(|&s| f32::from(i16::from_le_bytes(s)) / 32768.0).collect();
+        drop(reference);
+        let pcm_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if sink.is_closed() {
+            return Ok(());
+        }
+        let samples = pcm.len();
+        let mel = mel::encoder_input(&mel::log_mel(&pcm)?);
+        drop(pcm);
+        let mel_ms = start.elapsed().as_secs_f64() * 1000.0 - pcm_ms;
+        if sink.is_closed() {
+            return Ok(());
+        }
+        let encoding = Instant::now();
+        let speaker = self.speaker_encoder.as_mut().context("Base engine requires a speaker encoder")?.encode(&mel)?;
+        tracing::debug!(
+            id = speech.id,
+            samples,
+            frames = mel.len() / mel::BINS,
+            pcm_ms,
+            mel_ms,
+            encoder_ms = encoding.elapsed().as_secs_f64() * 1000.0,
+            prepare_ms = start.elapsed().as_secs_f64() * 1000.0,
+            "prepared reference"
+        );
+        self.enqueue_prepared(speech, Some(speaker), sink);
+        Ok(())
+    }
+
     /// Leases waiting requests in order; returns how many joined `running`.
     fn admit(&mut self) -> Result<usize> {
         let mut tokens = 0;
         let mut admitted = 0;
         while let Some(job) = self.waiting.front() {
+            if job.sink.is_closed() {
+                self.waiting.pop_front();
+                continue;
+            }
             if self.running.len() >= self.opts.max_batch || tokens + job.prompt.len() > self.opts.max_step_tokens {
                 break;
             }
@@ -222,6 +336,7 @@ impl Engine {
 
     /// One step: admit and start, one frame for every other running request, due chunks out.
     pub fn step(&mut self) -> Result<()> {
+        self.cancel();
         let fresh = self.admit()?;
         let spf = self.model.config.samples_per_frame;
         let split = self.running.len() - fresh;
@@ -241,6 +356,7 @@ impl Engine {
             take(old, &out, &self.model, spf);
         }
         self.emit();
+        self.prepare()?;
         Ok(())
     }
 
@@ -268,7 +384,7 @@ impl Engine {
     }
 
     fn idle(&self) -> bool {
-        self.waiting.is_empty() && self.running.is_empty()
+        self.pending.is_none() && self.waiting.is_empty() && self.running.is_empty()
     }
 }
 
@@ -289,8 +405,27 @@ pub fn start(
         let loaded = (|| {
             let limits = Limits { max_batch: opts.max_batch, max_tokens: opts.max_step_tokens, kv_gib: opts.kv_gib };
             let model = Model::load(device, &dir, limits).with_context(|| format!("load {}", dir.display()))?;
-            let (handle, inbox) = omni_engine::channel(info(&model, &name, max_input_chars), queue);
-            anyhow::Ok((handle, inbox, Engine::new(model, opts)))
+            let info = info(&model, &name, max_input_chars);
+            let queue = if info.reference_audio.is_some() { queue.min(8) } else { queue };
+            let (handle, inbox) = omni_engine::channel(info, queue);
+            let encoder = match &model.config.model.tts_model_type {
+                TtsModelType::CustomVoice => None,
+                TtsModelType::Base { speaker_encoder_config } => {
+                    // Warm the maximum shape before readiness, including the CPU
+                    // FFT/filterbank setup and the encoder's GEMM algorithms.
+                    let pcm = vec![0.0; speaker_encoder_config.sample_rate as usize * REFERENCE_MAX_SECONDS as usize];
+                    let mel = mel::encoder_input(&mel::log_mel(&pcm)?);
+                    let mut encoder =
+                        SpeakerEncoder::load(device, &dir, speaker_encoder_config, mel.len() / mel::BINS)?;
+                    encoder.encode(&mel)?;
+                    Some(encoder)
+                }
+            };
+            let engine = match encoder {
+                Some(encoder) => Engine::with_speaker_encoder(model, opts, encoder),
+                None => Engine::new(model, opts),
+            };
+            anyhow::Ok((handle, inbox, engine))
         })();
         match loaded {
             Ok((handle, inbox, engine)) => {
@@ -311,7 +446,10 @@ pub fn start(
 fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {
     let mut open = true;
     loop {
+        engine.cancel();
         if engine.idle() {
+            inbox.load.waiting.store(0, Ordering::Relaxed);
+            inbox.load.running.store(0, Ordering::Relaxed);
             if !open {
                 return Ok(());
             }
@@ -320,7 +458,10 @@ fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {
                 Err(_) => return Ok(()),
             }
         }
-        loop {
+        for _ in 0..engine.opts.max_batch.max(1) {
+            if !engine.can_receive() {
+                break;
+            }
             match inbox.rx.try_recv() {
                 Ok(s) => engine.enqueue(s.speech, s.sink),
                 Err(TryRecvError::Empty) => break,
@@ -330,8 +471,10 @@ fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {
                 }
             }
         }
+        inbox.load.waiting.store(engine.waiting(), Ordering::Relaxed);
+        inbox.load.running.store(engine.running.len(), Ordering::Relaxed);
         engine.step()?;
-        inbox.load.waiting.store(engine.waiting.len(), Ordering::Relaxed);
+        inbox.load.waiting.store(engine.waiting(), Ordering::Relaxed);
         inbox.load.running.store(engine.running.len(), Ordering::Relaxed);
     }
 }

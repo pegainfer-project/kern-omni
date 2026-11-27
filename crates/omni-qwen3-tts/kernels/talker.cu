@@ -50,10 +50,11 @@ extern "C" __global__ void talker_bias_silu(bf16* x, const bf16* bias, int cols,
   bias_act<true>(x, bias, cols, total);
 }
 
-// The codec track of a prompt row on top of its projected text:
-// x = x + bias + table[ids[r]] (no codec token when the id is negative).
+// The codec track of a prompt row on top of its projected text. Nonnegative
+// IDs gather from the codec table. -1 has no contribution, -2 adds the row's
+// sequence speaker embedding cast to the talker's dtype.
 extern "C" __global__ void talker_prompt_codec(bf16* x, const bf16* bias, const bf16* table, const int32_t* ids,
-                                               int dim) {
+                                               const float* speakers, const int32_t* seq, int dim) {
   const int c = threadIdx.x * 8;
   bf16* row = x + (int64_t)blockIdx.x * dim + c;
   const int id = ids[blockIdx.x];
@@ -66,6 +67,10 @@ extern "C" __global__ void talker_prompt_codec(bf16* x, const bf16* bias, const 
     load8(table + (int64_t)id * dim + c, e);
 #pragma unroll
     for (int k = 0; k < 8; ++k) v[k] += e[k];
+  } else if (id == -2) {
+    const float* speaker = speakers + (int64_t)seq[blockIdx.x] * dim + c;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] += round_bf16(speaker[k]);
   }
   store8(row, v);
 }

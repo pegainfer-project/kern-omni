@@ -1,9 +1,127 @@
-# Qwen3-TTS Base reference recordings
+# Qwen3-TTS Base
 
-These tools record the official 1.7B Base implementation for the subsequent
-Rust/CUDA voice-clone work. They do not add Base support to the server.
-The existing [CustomVoice golden workflow](qwen3-tts.md#correctness) remains
-available through the same `golden.py` command.
+The 1.7B Base checkpoint serves x-vector-only voice cloning. A speaker encoder
+turns reference audio into a speaker embedding, then the talker and codec
+decoder generate streamed audio. Both Base and CustomVoice use the
+`qwen3-tts` subcommand.
+
+## Serve Base
+
+For an RTX 3090 (sm86), build and start with a small batch, prompt-token and
+KV budget.
+
+```bash
+OMNI_CUDA_ARCH=86 CARGO_TARGET_DIR=target-sm86 \
+  cargo build --release --locked -p omni-server --features qwen3-tts
+CUDA_VISIBLE_DEVICES=0 target-sm86/release/pega-omni qwen3-tts \
+  --model-path /models/Qwen3-TTS-12Hz-1.7B-Base \
+  --max-batch 2 --max-step-tokens 1024 --kv-gib 1
+```
+
+The served model name defaults to the checkpoint directory's name;
+`--model` overrides it. Base lists no preset voices at `/v1/audio/voices`.
+The required `voice` request field can be a placeholder such as `alloy`.
+
+Send `ref_audio` as a `data:audio/wav;base64,...` URI and explicitly set
+`x_vector_only_mode` to `true`. The clip must be 1–30 seconds of mono or stereo
+PCM16 WAV at 16, 24, 44.1 or 48 kHz. The server mixes to mono and resamples to
+24 kHz before preparing the speaker embedding. `ref_text` is ignored in this
+mode. `null` means omission for all three reference fields. Missing
+`ref_audio` returns a `400` naming `ref_audio`. Setting
+`x_vector_only_mode` to `false` or omitting it selects ICL, which currently
+returns a `400` naming `x_vector_only_mode`.
+
+The official SDK passes these top-level fields through `extra_body`.
+
+```python
+import base64
+from pathlib import Path
+
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+reference = base64.b64encode(Path("reference.wav").read_bytes()).decode("ascii")
+with client.audio.speech.with_streaming_response.create(
+    model="Qwen3-TTS-12Hz-1.7B-Base",
+    voice="alloy",
+    input="Hello from the cloned voice.",
+    response_format="pcm",
+    extra_body={
+        "ref_audio": "data:audio/wav;base64," + reference,
+        "x_vector_only_mode": True,
+    },
+) as response:
+    response.stream_to_file("speech.pcm")
+```
+
+The output is mono 24 kHz PCM16. `response_format="wav"` wraps it in WAV.
+`response_format="pcm", stream_format="sse"` sends audio events. All three
+forms stream regardless of the fixed full-text prompt layout.
+
+Run the SDK compatibility check against the Base server with a real reference
+WAV from the fixture archive below.
+
+```bash
+uv run --with openai tools/openai_sdk_check.py \
+  --model Qwen3-TTS-12Hz-1.7B-Base --x-vector-only \
+  --reference-wav qwen3-tts-base-fixtures-v1/prepared/en-short.wav
+```
+
+This checks WAV, PCM, SSE, reference-field errors and model listing. Without
+`--reference-wav`, it sends a one-second tone for protocol checks.
+`--reference-audio` checks both reference modes on the simulator.
+Without either flag, the script checks preset voices.
+
+The sections below describe the official reference recordings. The existing
+[CustomVoice golden workflow](qwen3-tts.md#correctness) remains available
+through the same `golden.py` command.
+
+## Reference preparation
+
+The Base engine warms its speaker encoder before serving. It prepares at most
+one reference per tick, after advancing and emitting the running streams.
+The 30-second input limit bounds that work to 2,812 mel frames. Preparation
+completes before a request leases Talker KV or codec state.
+
+The submission channel holds at most eight requests. Internally, one raw
+reference and prepared prompts share a `max_batch` waiting limit. Canceled
+requests are removed before preparation and admission, and between preparation
+stages. The waiting gauge includes reference preparation.
+
+## Rust validation
+
+On 2026-11-25, an RTX 3090 (sm86) replayed all four main x-vector-only fixtures
+with BF16 and the fixed full-text layout. The tests also replayed CustomVoice.
+
+| Check | Result |
+|---|---|
+| FP32 mel / BF16 encoder input | Maximum absolute error 0.002095. Of 507,008 BF16 values, 17 differed by one ULP. |
+| Speaker vector from computed mel | Worst cosine 0.99999611, maximum relative L2 error 0.002789. Repeated inputs after different references gave identical vectors. |
+| Base prompt / talker / predictor | Worst cosines 0.999992 / 0.99988 / 0.99945. Talker and predictor argmax agreement 98.8–99.6% / 93.9–94.6%. |
+| Base waveform, synchronized / delayed stream | English short 26.77 / 26.98 dB, English long 35.11 / 35.07 dB, Chinese short 32.13 / 31.76 dB, Chinese long 35.83 / 35.81 dB. |
+| CustomVoice waveform | 34.59 / 34.19 dB. |
+
+English short has a 25 dB waveform threshold. Replaying its exact recorded
+codes through the upstream `847b23f` decoder produced 27.08 dB. The other
+waveforms keep a 30 dB threshold.
+
+Run the GPU checks with the fixture directory and both checkpoints configured.
+
+```bash
+OMNI_CUDA_ARCH=86 CARGO_TARGET_DIR=target-sm86 CUDA_VISIBLE_DEVICES=0 \
+  OMNI_QWEN3_TTS_BASE_MODEL=/models/Qwen3-TTS-12Hz-1.7B-Base \
+  OMNI_QWEN3_TTS_BASE_FIXTURES="$PWD/qwen3-tts-base-fixtures-v1/fixtures" \
+  OMNI_QWEN3_TTS_MODEL=/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  OMNI_QWEN3_TTS_GOLDEN=/fixtures/en-ryan.safetensors \
+  cargo test --release --locked -p omni-qwen3-tts \
+    --test speaker_mel --test speaker_encoder --test golden --test engine \
+    -- --nocapture --test-threads=1
+```
+
+The real Base service passed the official SDK 3.19.0 checks for WAV, PCM and
+SSE. Its integration test exercises two reference speakers, 30-second
+references, queue saturation, cancellation and subsequent requests. Prepared
+WAV samples normalized by 32768 match the fixture's reference PCM exactly.
 
 ## Download the fixtures
 
